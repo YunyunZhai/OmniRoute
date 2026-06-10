@@ -1,7 +1,10 @@
 import { BaseExecutor, type ExecuteInput } from "./base.ts";
 import type { ProviderCredentials } from "./base.ts";
 import tlsClient from "../utils/tlsClient.ts";
-import { acquireBrowserContext, openPage } from "../services/browserPool.ts";
+import { existsSync } from "node:fs";
+
+type BrowserRef = import("playwright").Browser;
+type PageRef = import("playwright").Page;
 
 const API_BASE = "https://theoldllm.vercel.app";
 const API_PATH = "/api/chatgpt";
@@ -83,16 +86,87 @@ function invalidateToken(): void {
   tokenCache.expiresAt = 0;
 }
 
-// ── Playwright token capture (via shared browser pool) ──────────────
+// ── Playwright token capture (fallback only) ──────────────────────────────
+
+let _browser: Promise<BrowserRef> | null = null;
+let _cleanupRegistered = false;
+
+function registerCleanup(): void {
+  if (_cleanupRegistered) return;
+  _cleanupRegistered = true;
+  const cleanup = () => {
+    if (_browser) {
+      _browser.then((b) => b.close().catch(() => {})).catch(() => {});
+      _browser = null;
+    }
+  };
+  process.on("exit", cleanup);
+  process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+  process.on("SIGINT", () => { cleanup(); process.exit(0); });
+}
+
+function getProxyFromEnv(): string | undefined {
+  return (
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    process.env.ALL_PROXY ||
+    process.env.all_proxy ||
+    undefined
+  );
+}
+
+function isDisplayAvailable(): boolean {
+  const display = process.env.DISPLAY;
+  if (!display) return false;
+  try {
+    const displayNum = display.replace(/^:/, "");
+    return existsSync(`/tmp/.X11-unix/X${displayNum}`);
+  } catch {
+    return false;
+  }
+}
+
+async function getBrowser(): Promise<BrowserRef> {
+  if (_browser) {
+    try {
+      const b = await _browser;
+      if (b.isConnected()) return b;
+    } catch {
+      _browser = null;
+    }
+  }
+  registerCleanup();
+  _browser = (async () => {
+    const { chromium } = await import("playwright");
+    const proxy = getProxyFromEnv();
+    const canUseHeadful = isDisplayAvailable();
+    const launchArgs = [
+      "--disable-blink-features=AutomationControlled",
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--window-size=1280,1024",
+    ];
+    if (proxy) {
+      launchArgs.push(`--proxy-server=${proxy}`);
+    }
+    return await chromium.launch({
+      headless: !canUseHeadful,
+      args: launchArgs,
+    });
+  })();
+  return _browser;
+}
 
 async function captureTokenViaBrowser(): Promise<string> {
-  const pooled = await acquireBrowserContext("theoldllm", {
-    cookieDomain: "theoldllm.vercel.app",
+  const browser = await getBrowser();
+  const context = await browser.newContext({
     userAgent: CHROME_UA,
-    warmupUrl: API_BASE,
+    viewport: { width: 1280, height: 1024 },
   });
-
-  const context = pooled.context;
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     (window as any).chrome = {
@@ -112,7 +186,7 @@ async function captureTokenViaBrowser(): Promise<string> {
     });
   });
 
-  const page = await openPage(pooled);
+  const page = await context.newPage();
   const navTimeout = Number(process.env.THEOLDLLM_NAV_TIMEOUT_MS) || 30_000;
 
   try {
