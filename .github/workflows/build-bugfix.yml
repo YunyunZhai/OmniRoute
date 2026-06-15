@@ -1,0 +1,39 @@
+name: Build Bugfix Standalone
+
+on:
+  workflow_dispatch:
+    branches:
+      - custom/stable-fix
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build standalone
+        run: npm run build
+
+      - name: Ensure better-sqlite3 in standalone
+        run: |
+          cp -r node_modules/better-sqlite3 .build/next/standalone/node_modules/ 2>/dev/null || true
+
+      - name: Package standalone
+        run: |
+          tar -czf /tmp/omniroute-standalone.tar.gz \
+            --exclude='.build/next/cache' \
+            -C .build/next/standalone .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: omniroute-standalone
+          path: /tmp/omniroute-standalone.tar.gz
+          retention-days: 7
