@@ -2,8 +2,6 @@ name: Build Bugfix Standalone
 
 on:
   workflow_dispatch:
-    branches:
-      - custom/stable-fix
 
 jobs:
   build:
