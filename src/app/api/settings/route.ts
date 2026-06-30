@@ -4,6 +4,7 @@ import { getRuntimePorts } from "@/lib/runtime/ports";
 import { updateSettingsSchema } from "@/shared/validation/settingsSchemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
+import { resolveModelLockoutSettings } from "@/lib/resilience/modelLockoutSettings";
 import {
   validateProxyUrl,
   upsertUpstreamProxyConfig,
@@ -24,6 +25,19 @@ import { isDashboardSessionAuthenticated } from "@/shared/utils/apiAuth";
 import { isCliTokenAuthValid } from "@/lib/middleware/cliTokenAuth";
 import { extractApiKey } from "@/sse/services/auth";
 import { getApiKeyMetadata } from "@/lib/db/apiKeys";
+
+/**
+ * Force this route to run dynamically per-request and never be cached/prerendered.
+ * Combined with the `Cache-Control: no-store` response header below, this keeps
+ * persisted settings (e.g. dashboard preferences, debugMode, hidden sidebar
+ * items) visible immediately after refresh or restart instead of falling back
+ * to stale Next.js fetch cache. Ported from upstream decolua/9router#951.
+ */
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+/** Response headers applied to every successful GET/PATCH on /api/settings. */
+const SETTINGS_RESPONSE_HEADERS = { "Cache-Control": "no-store" } as const;
 
 /**
  * Settings keys whose change broadens attack surface. Spec §Security:
@@ -161,19 +175,22 @@ export async function GET(request: Request) {
       // best effort — don't fail GET /api/settings if this lookup fails
     }
 
-    return NextResponse.json({
-      ...safeSettings,
-      hasPassword: hasManagementPasswordConfigured(settings),
-      runtimePorts,
-      apiPort: runtimePorts.apiPort,
-      dashboardPort: runtimePorts.dashboardPort,
-      cloudConfigured: Boolean(cloudUrl),
-      cloudUrl,
-      machineId,
-      ...(cliproxyapiModelMapping !== null
-        ? { cliproxyapi_model_mapping: cliproxyapiModelMapping }
-        : {}),
-    });
+    return NextResponse.json(
+      {
+        ...safeSettings,
+        hasPassword: hasManagementPasswordConfigured(settings),
+        runtimePorts,
+        apiPort: runtimePorts.apiPort,
+        dashboardPort: runtimePorts.dashboardPort,
+        cloudConfigured: Boolean(cloudUrl),
+        cloudUrl,
+        machineId,
+        ...(cliproxyapiModelMapping !== null
+          ? { cliproxyapi_model_mapping: cliproxyapiModelMapping }
+          : {}),
+      },
+      { headers: SETTINGS_RESPONSE_HEADERS }
+    );
   } catch (error) {
     console.log("Error getting settings:", error);
     return NextResponse.json({ error: "Failed to load settings" }, { status: 500 });
@@ -219,6 +236,14 @@ export async function PATCH(request: Request) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
     const body: typeof validation.data & { password?: string } = { ...validation.data };
+
+    // Sanitize model lockout settings: clamp values to valid bounds so that
+    // stale DB values or hand-crafted requests don't bypass range validation.
+    if (body.modelLockout) {
+      body.modelLockout = resolveModelLockoutSettings({
+        modelLockout: body.modelLockout as Record<string, unknown>,
+      }) as typeof body.modelLockout;
+    }
 
     // Security-impacting gate (T-011, spec AC-4 / AC-5). Computed from the
     // VALIDATED body so we never trip on stray unknown keys. If any security
@@ -367,7 +392,7 @@ export async function PATCH(request: Request) {
     }
 
     const { password, ...safeSettings } = settings;
-    return NextResponse.json(safeSettings);
+    return NextResponse.json(safeSettings, { headers: SETTINGS_RESPONSE_HEADERS });
   } catch (error) {
     console.log("Error updating settings:", error);
     return NextResponse.json({ error: "Failed to update settings" }, { status: 500 });

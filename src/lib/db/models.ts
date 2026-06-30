@@ -111,6 +111,16 @@ export type ModelCompatOverride = {
   compatByProtocol?: CompatByProtocolMap;
   upstreamHeaders?: Record<string, string>;
   isHidden?: boolean;
+  /**
+   * #3782 — distinct "deleted" marker, separate from {@link isHidden}.
+   *
+   * `isHidden` is set by the EYE/visibility toggle and must be PRESERVED across a
+   * re-sync (the model stays listed-but-hidden). `isDeleted` is set by the trash/
+   * DELETE route and means "drop this id on every re-import" (#3199). Keeping the
+   * two flags distinct is what lets {@link replaceSyncedAvailableModelsForConnection}
+   * preserve eye-hidden models while still dropping deleted ones.
+   */
+  isDeleted?: boolean;
 };
 
 function readCompatList(providerId: string): ModelCompatOverride[] {
@@ -156,6 +166,8 @@ export type ModelCompatPatch = {
   /** Replace top-level extra headers for override-only rows; omit to leave unchanged. */
   upstreamHeaders?: Record<string, string> | null;
   isHidden?: boolean | null;
+  /** #3782 — distinct delete marker; set by the DELETE route, never by the eye toggle. */
+  isDeleted?: boolean | null;
 };
 
 function compatByProtocolHasEntries(map: CompatByProtocolMap | undefined): boolean {
@@ -210,11 +222,20 @@ export function mergeModelCompatOverride(
       next.isHidden = Boolean(patch.isHidden);
     }
   }
+  if ("isDeleted" in patch) {
+    if (patch.isDeleted === null || patch.isDeleted === false) {
+      delete next.isDeleted;
+    } else {
+      next.isDeleted = Boolean(patch.isDeleted);
+    }
+  }
   const hasHiddenFlag = Object.prototype.hasOwnProperty.call(next, "isHidden");
+  const hasDeletedFlag = Object.prototype.hasOwnProperty.call(next, "isDeleted");
   if (
     next.normalizeToolCallId ||
     hasPreserveFlag ||
     hasHiddenFlag ||
+    hasDeletedFlag ||
     compatByProtocolHasEntries(next.compatByProtocol) ||
     hasTopUpstream
   ) {
@@ -274,6 +295,34 @@ export async function deleteModelAlias(alias: string) {
   const db = getDbInstance();
   db.prepare("DELETE FROM key_value WHERE namespace = 'modelAliases' AND key = ?").run(alias);
   backupDbFile("pre-write");
+}
+
+/**
+ * Cascade-delete every model-alias row that resolves to the given provider.
+ *
+ * Managed/imported aliases are stored as `key = <alias>`, `value = "<providerId>/<model>"`
+ * (e.g. `setModelAlias("x-fast", "providerX/fast-model")`). When a custom provider is
+ * removed, its connections and node are deleted but these alias rows are left behind,
+ * which then block re-importing the same provider ("already exists" / no new models) — see
+ * #1409. This removes every alias whose stored value begins with `<providerId>/`, so a
+ * fresh import is unblocked.
+ *
+ * Only string values starting with the exact `"<providerId>/"` prefix match, so unrelated
+ * providers and user-facing settings aliases (whose value is the bare alias, not a
+ * `<providerId>/<model>` string) are left untouched.
+ *
+ * @returns the list of alias keys that were removed.
+ */
+export async function deleteModelAliasesForProvider(providerId: string): Promise<string[]> {
+  const prefix = `${providerId}/`;
+  const aliases = await getModelAliases();
+  const removed: string[] = [];
+  for (const [alias, value] of Object.entries(aliases)) {
+    if (typeof value !== "string" || !value.startsWith(prefix)) continue;
+    await deleteModelAlias(alias);
+    removed.push(alias);
+  }
+  return removed;
 }
 
 // ──────────────── MITM Alias ────────────────
@@ -359,7 +408,10 @@ export async function addCustomModel(
   // #2905: optional per-model wire format override (e.g. "claude" for an
   // opencode-go custom model). When unset, routing falls back to the provider
   // default format.
-  targetFormat?: string
+  targetFormat?: string,
+  // #1294: optional per-model token limits supplied from the "add custom model"
+  // form. Persisted under the same keys the /v1/models catalog reads back.
+  tokenLimits: { inputTokenLimit?: number; outputTokenLimit?: number } = {}
 ) {
   const db = getDbInstance();
   const row = db
@@ -378,6 +430,12 @@ export async function addCustomModel(
     apiFormat,
     supportedEndpoints,
     ...(targetFormat ? { targetFormat } : {}),
+    ...(tokenLimits.inputTokenLimit != null
+      ? { inputTokenLimit: tokenLimits.inputTokenLimit }
+      : {}),
+    ...(tokenLimits.outputTokenLimit != null
+      ? { outputTokenLimit: tokenLimits.outputTokenLimit }
+      : {}),
   };
   models.push(model);
   db.prepare(
@@ -486,14 +544,6 @@ export async function replaceCustomModels(
     ).run(providerId, JSON.stringify(merged));
   }
 
-  // Remove compat overrides for models that no longer exist
-  const newIds = new Set(models.map((m) => m.id));
-  const compatList = readCompatList(providerId);
-  const filteredCompat = compatList.filter((e) => newIds.has(e.id));
-  if (filteredCompat.length !== compatList.length) {
-    writeCompatList(providerId, filteredCompat);
-  }
-
   backupDbFile("pre-write");
   return merged;
 }
@@ -544,6 +594,9 @@ export interface SyncedAvailableModel {
   outputTokenLimit?: number;
   description?: string;
   supportsThinking?: boolean;
+  // #4264: image-input capability captured at sync time (e.g. OpenRouter
+  // `architecture.input_modalities`/`modality`) so the catalog can surface vision.
+  supportsVision?: boolean;
 }
 
 type SyncedAvailableModelInput = Omit<SyncedAvailableModel, "source"> & {
@@ -587,6 +640,7 @@ function normalizeSyncedAvailableModel(model: unknown): SyncedAvailableModel | n
       : {}),
     ...(typeof record.description === "string" ? { description: record.description } : {}),
     ...(record.supportsThinking === true ? { supportsThinking: true } : {}),
+    ...(record.supportsVision === true ? { supportsVision: true } : {}),
   };
 }
 
@@ -714,10 +768,15 @@ export async function replaceSyncedAvailableModelsForConnection(
 ): Promise<SyncedAvailableModel[]> {
   const db = getDbInstance();
   const key = `${providerId}:${connectionId}`;
-  // #3199: drop ids the operator has deleted/hidden so a re-fetch does not
-  // re-import a model that was explicitly removed.
+  // #3199: drop ids the operator DELETED (trash) so a re-fetch does not re-import
+  // a model that was explicitly removed.
+  // #3782: key ONLY on the distinct `isDeleted` marker — NOT on `isHidden`.
+  // Eye/visibility-hidden models (`isHidden:true`, no `isDeleted`) must stay in
+  // the synced store so they remain listed-but-hidden across re-syncs instead of
+  // churning back on through the managed-alias path ("Auto Sync Enabling all
+  // Models"). See getModelIsDeleted for the legacy-row caveat.
   const normalizedModels = normalizeSyncedAvailableModels(models).filter(
-    (m) => !getModelIsHidden(providerId, m.id)
+    (m) => !getModelIsDeleted(providerId, m.id)
   );
   if (normalizedModels.length === 0) {
     db.prepare("DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?").run(
@@ -1032,6 +1091,66 @@ export function getModelIsHidden(providerId: string, modelId: string): boolean {
   }
   const co = readCompatList(providerId).find((e) => e.id === modelId);
   return Boolean(co?.isHidden);
+}
+
+/**
+ * Get a map of provider ID → set of hidden model IDs from all modelCompatOverrides
+ * and customModels. Used by auto-combo candidate building to skip user-hidden models.
+ * Single bulk DB query — not N+1 per model.
+ */
+export function getHiddenModelsByProvider(): Map<string, Set<string>> {
+  const db = getDbInstance();
+  const result = new Map<string, Set<string>>();
+
+  // Query all rows from key_value for both namespaces
+  const rows = db
+    .prepare(
+      "SELECT key, value FROM key_value WHERE namespace IN ('modelCompatOverrides', 'customModels')"
+    )
+    .all() as Array<{ key: string; value: string | null }>;
+
+  for (const row of rows) {
+    if (!row.value) continue;
+    try {
+      const parsed = JSON.parse(row.value);
+      if (!Array.isArray(parsed)) continue;
+      for (const entry of parsed) {
+        if (entry && typeof entry === "object" && entry.isHidden) {
+          const modelId = entry.id;
+          if (typeof modelId === "string" && modelId.length > 0) {
+            if (!result.has(row.key)) result.set(row.key, new Set());
+            result.get(row.key)!.add(modelId);
+          }
+        }
+      }
+    } catch {
+      // Skip malformed entries
+    }
+  }
+
+  return result;
+}
+
+/**
+ * #3782 — Check if a model was DELETED (trash) rather than merely eye-hidden.
+ *
+ * Only the DELETE route sets `isDeleted`. The sync re-import filter keys on this
+ * (not on `isHidden`) so eye-hidden models survive a re-sync while deleted ones
+ * stay dropped.
+ *
+ * Legacy caveat: rows written by the DELETE route BEFORE this change carry only
+ * `isHidden:true` (no `isDeleted`). Treating bare legacy `isHidden:true` as
+ * deleted here would resurrect the #3782 bug for eye-hidden models; treating it
+ * as "kept" would resurrect previously-deleted models. Resurrecting a deleted
+ * model is the less-surprising, recoverable outcome (the operator can re-hide or
+ * re-delete it), whereas silently dropping an eye-hidden model is the reported
+ * regression — so we deliberately key ONLY on the explicit `isDeleted` flag and
+ * accept that a handful of pre-existing deleted rows may reappear once after the
+ * upgrade. Going forward both paths write the correct distinct markers.
+ */
+export function getModelIsDeleted(providerId: string, modelId: string): boolean {
+  const co = readCompatList(providerId).find((e) => e.id === modelId);
+  return Boolean(co?.isDeleted);
 }
 
 /**

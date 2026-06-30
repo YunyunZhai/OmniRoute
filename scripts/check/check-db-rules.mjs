@@ -11,9 +11,12 @@
 //  (c) Nenhum SQL cru em src/app/api/**/route.ts ou open-sse/handlers/*.ts.
 //      SQL deve viver em src/lib/db/ (Hard Rule #5). Ofensores pré-existentes
 //      são congelados; QUALQUER novo SQL cru em rota/handler falha.
+// Stale-enforcement (6A.3): entradas em INTENTIONALLY_INTERNAL / EXTERNAL_DB_ALLOWED
+// que não suprimem nenhuma violação real → gate falha com instrução de remoção.
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { assertNoStale } from "./lib/allowlist.mjs";
 
 const cwd = process.cwd();
 const DB_DIR = path.join(cwd, "src/lib/db");
@@ -36,12 +39,16 @@ const HANDLERS_DIR = path.join(cwd, "open-sse/handlers");
 //                        sem investigação — pode ser reserva de schema ou F2 pendente
 export const INTENTIONALLY_INTERNAL = new Set([
   "_rowTypes", // type-only: 5 importers internos em db/ (AgentBridge/Inspector row types)
+  "accessTokens", // intentionally-internal: 4 rotas /api/cli/* (connect, whoami, tokens, tokens/[id]) + server/authz/accessTokenAuth.ts via import direto "@/lib/db/accessTokens" (Rule #2)
+  "apiKeyColumnFallbacks", // db-internal: importado só por db/apiKeys.ts (API_KEY_COLUMN_FALLBACKS — fallbacks de coluna split do apiKeys.ts)
+  "apiKeyUsageLimitFields", // db-internal: importado só por db/apiKeys.ts (helpers de campo de limite de uso split do apiKeys.ts; mig 101)
+  "caseMapping", // db-internal: importado só por db/core.ts (toSnakeCase/toCamelCase/objToSnake — column-mapping snake↔camel split do core.ts, #4947)
   "cleanup", // intentionally-internal: 3 API routes (purge-quota-snapshots, purge-call-logs, purge-detailed-logs)
   "cliToolState", // intentionally-internal: 14+ API routes em /api/cli-tools/*-settings
   "comboForecast", // intentionally-internal: src/lib/usage/comboForecast.ts
   "commandCodeAuth", // intentionally-internal: 5 API routes em /api/providers/command-code/auth/*
   "compression", // intentionally-internal: 2 API routes (settings/compression, context/rtk/config)
-  "compressionScheduler", // DEAD?: 0 importers na auditoria de 2026-06-11; mantido para schema reservation
+  "vacuumScheduler", // intentionally-internal: src/instrumentation-node.ts (dynamic import, lifecycle wiring per Rule #2)
   "detailedLogs", // intentionally-internal: 3 callers (callLogs.ts, logs/detail route, embeddings handler)
   "discovery", // DEAD?: 0 importers na auditoria de 2026-06-11; lib/discovery/index.ts não usa db/discovery
   "domainState", // intentionally-internal: 5 callers (batchWriter, circuitBreaker, costRules, fallbackPolicy, lockoutPolicy)
@@ -51,15 +58,19 @@ export const INTENTIONALLY_INTERNAL = new Set([
   "migrationRunner", // db-internal: importado por db/core.ts (runMigrations ao inicializar o DB)
   "notion", // intentionally-internal: settings/notion API route + open-sse/mcp-server/tools/notionTools.ts
   "obsidian", // intentionally-internal: src/lib/obsidianSync.ts + settings/obsidian route + MCP obsidianTools.ts
+  "optimizationSettings", // db-internal: imported by db/core.ts for SQLite PRAGMA application helpers that require the live adapter
   "pluginMetrics", // DEAD? (production): write path não foi conectado ainda (documentado no cabeçalho do módulo); testado por tests/unit/plugins-metrics.test.ts
   "prompts", // DEAD? (production): zero callers de produção encontrados; domínio domain/prompts.ts é independente; testado por tests/integration/proxy-pipeline.test.ts
+  "providerNodeSelect", // db-internal: importado só por db/providers.ts (selectProviderNodeForConnection — lógica pura de seleção de provider node split do providers.ts, #4421)
   "providerStats", // intentionally-internal: src/app/api/provider-stats/route.ts
   "recovery", // intentionally-internal: bin/cli/runtime.mjs (import() dinâmico) + tests
+  "schemaColumns", // db-internal: importado só por db/core.ts (ensureProviderConnections/UsageHistory/CallLogsColumns + hasColumn/hasTable/getTableColumns — schema-column reconciliation split do core.ts, #4948)
   "secrets", // intentionally-internal: src/instrumentation-node.ts (import() dinâmico na inicialização)
   "serviceModels", // intentionally-internal: 3 callers (services/modelSync, services/bootstrap, /api/services/9router/models)
   "stateReset", // db-internal: 3 callers dentro de src/lib/db/ (core, backup, apiKeys) para coordenação de reset
   "stats", // intentionally-internal: src/app/api/settings/database/refresh-stats/route.ts
   "tierConfig", // intentionally-internal: open-sse/services/tierResolver.ts (require() dinâmico)
+  "webSessionDedup", // db-internal: importado só por db/providers.ts (webSessionCredentialKey/parseProviderSpecificData — helpers puros de dedup de credencial web-session split do providers.ts, #3368 PR6)
 ]);
 
 // Alias para retrocompatibilidade com os testes existentes que importam KNOWN_UNEXPORTED.
@@ -215,10 +226,16 @@ export function collectSqlScanFiles(apiDir = API_DIR, handlersDir = HANDLERS_DIR
 
 function main() {
   const failures = [];
+  const localDbSource = fs.readFileSync(LOCAL_DB, "utf8");
 
   // (a) re-export completeness
   const dbModules = collectDbModules();
-  const reexported = extractReexportedModules(fs.readFileSync(LOCAL_DB, "utf8"));
+  const reexported = extractReexportedModules(localDbSource);
+
+  // Live unexported modules BEFORE allowlist filtering (needed for stale-enforcement).
+  const liveUnexported = dbModules.filter((mod) => !reexported.has(mod));
+  assertNoStale(INTENTIONALLY_INTERNAL, liveUnexported, "check-db-rules:unexported");
+
   const missing = findMissingReexports(dbModules, reexported);
   if (missing.length) {
     failures.push(
@@ -230,7 +247,7 @@ function main() {
   }
 
   // (b) localDb sem lógica
-  if (hasLogic(fs.readFileSync(LOCAL_DB, "utf8"))) {
+  if (hasLogic(localDbSource)) {
     failures.push(
       `[#2 sem-lógica] src/lib/localDb.ts contém lógica (function/class/arrow). É camada de` +
         ` re-export apenas — mova a lógica para um módulo src/lib/db/.`
@@ -238,7 +255,12 @@ function main() {
   }
 
   // (c) SQL cru fora de db/
-  const rawSql = findRawSql(collectSqlScanFiles());
+  // Live raw-SQL offenders BEFORE allowlist filtering (needed for stale-enforcement).
+  const scanFiles = collectSqlScanFiles();
+  const liveRawSql = findRawSql(scanFiles, new Set());
+  assertNoStale(EXTERNAL_DB_ALLOWED, liveRawSql, "check-db-rules:raw-sql");
+
+  const rawSql = findRawSql(scanFiles);
   if (rawSql.length) {
     failures.push(
       `[#5 sql-cru] ${rawSql.length} arquivo(s) com SQL cru fora de src/lib/db/:\n` +
@@ -250,12 +272,14 @@ function main() {
 
   if (failures.length) {
     console.error(`[check-db-rules] FALHOU:\n\n` + failures.join("\n\n"));
-    process.exit(1);
+    process.exitCode = 1;
   }
-  console.log(
-    `[check-db-rules] OK (${dbModules.length} módulos db/, ${reexported.size} re-exportados, ` +
-      `${INTENTIONALLY_INTERNAL.size} intencionalmente-internos (Rule #2); ${EXTERNAL_DB_ALLOWED.size} leituras de DB externo permitidas (#3500))`
-  );
+  if (!process.exitCode) {
+    console.log(
+      `[check-db-rules] OK (${dbModules.length} módulos db/, ${reexported.size} re-exportados, ` +
+        `${INTENTIONALLY_INTERNAL.size} intencionalmente-internos (Rule #2); ${EXTERNAL_DB_ALLOWED.size} leituras de DB externo permitidas (#3500))`
+    );
+  }
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || "").href) main();

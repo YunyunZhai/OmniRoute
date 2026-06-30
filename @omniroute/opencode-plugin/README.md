@@ -18,23 +18,50 @@ This plugin solves that by:
 
 ## Install
 
-Once published to npm:
+The plugin ships **pre-built inside the `omniroute` npm package** since v3.8.23.
+If you have OmniRoute installed, the plugin is already on disk:
 
 ```sh
-npm install @omniroute/opencode-plugin
+# 1. One command — copy the plugin into OpenCode and update opencode.json
+omniroute setup opencode --auth
+
+# 2. Follow the interactive prompt to enter your OmniRoute API key
+# 3. Restart OpenCode — /models lists the full live catalog
 ```
 
-Until then (or for local development), reference the built artifact directly. Either extract the package into your OpenCode plugins dir and point at the extracted `dist/index.js`:
+The `--auth` flag runs `opencode auth login --provider omniroute` automatically.
+Use `--base-url` to point at a non-default OmniRoute address:
 
 ```sh
-# from inside the OmniRoute repo
+omniroute setup opencode --base-url https://or.example.com --auth
+```
+
+### What it does
+
+1. Locates the bundled plugin inside the omniroute installation
+2. Copies `dist/` + `package.json` to `~/.config/opencode/plugins/omniroute/`
+3. Writes/updates `opencode.json` with the plugin entry (idempotent, replaces legacy entries)
+4. (With `--auth`) runs `opencode auth login` so the API key is stored
+
+Re-run any time to update the plugin or change the base URL. Older entries for
+`@omniroute/opencode-provider` or the legacy `opencode-omniroute-auth` package are
+automatically cleaned up.
+
+### Manual install (without omniroute CLI)
+
+If you cannot run `omniroute setup opencode` (local dev, CI, air-gapped), reference
+the built artifact directly:
+
+```sh
 cd @omniroute/opencode-plugin && npm run build && npm pack
 # then extract into ~/.config/opencode/plugins/omniroute-opencode-plugin/
 ```
 
+And add the entry to `opencode.json` manually (see Quick Start below).
+
 Peer dep: `@opencode-ai/plugin` (managed by your OpenCode install).
 
-## Quick start (single instance)
+## Quick start (single instance, manual)
 
 ```jsonc
 // opencode.json
@@ -42,7 +69,7 @@ Peer dep: `@opencode-ai/plugin` (managed by your OpenCode install).
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     [
-      "@omniroute/opencode-plugin",
+      "./plugins/omniroute-opencode-plugin/dist/index.js",
       {
         "providerId": "omniroute",
         "baseURL": "https://or.example.com",
@@ -169,7 +196,7 @@ Every field is optional. Defaults mirror v0.1.0 behaviour so existing `opencode.
 | `combos`              | `boolean` | `true`  | Discover `/api/combos` and surface them as pseudo-models with LCD capabilities. Combos are keyed under the `combo/<slug>` namespace and labelled `Combo: <name>` in the model picker so they're distinguishable from raw provider/model pairs.                                                                                                                                                                                                                                                                                                                               |
 | `enrichment`          | `boolean` | `true`  | Pull display names from `/api/pricing/models` AND per-million-token pricing (`input`, `output`, `cached` → `cacheRead`, `cache_creation` → `cacheWrite`) from `/api/pricing`, then overlay both onto the live catalog (so the UI shows `Claude 4.7 Opus` with `cost.input: 5`, `cost.output: 25` instead of raw IDs and zeroed cost).                                                                                                                                                                                                                                        |
 | `compressionMetadata` | `boolean` | `false` | Pull `/api/context/combos` so combo names get tagged with their compression pipeline, e.g. `Combo: claude-primary [rtk🟡 → caveman🟠]`. Intensity tokens render as traffic-light emoji (🟢 lite/minimal · 🟡 standard · 🟠 aggressive/full · 🔴 ultra) so the picker advertises "how compressed" each combo is at a glance.                                                                                                                                                                                                                                                  |
-| `providerTag`         | `boolean` | `true`  | Prepend a short upstream-provider label to the enriched display name with `" - "` separator, so `cc/claude-opus-4-7 → Claude - Claude Opus 4.7` differs visibly from `kr/claude-opus-4-7 → Kiro - Claude Opus 4.7` in the OC TUI model picker. Label resolution: use `/api/pricing/models[<alias>].name` verbatim when ≤8 chars (e.g. `Claude`, `Kiro`, `Codex`, `Qwen`), otherwise fall back to `UPPER(alias)` (e.g. `GitHub Models` → `GHM`, `Gemini-cli` → `GEMINI-CLI`). Idempotent. Combos intentionally skipped (the `Combo: ` prefix already conveys multi-upstream). |
+| `providerTag`         | `boolean` | `true`  | Prepend a short upstream-provider label to the enriched display name with `" - "` separator, so `cc/claude-opus-4-7 → Claude - Claude Opus 4.7` differs visibly from `kr/claude-opus-4-7 → Kiro - Claude Opus 4.7` in the OC TUI model picker. Label resolution: use `/api/pricing/models[<alias>].name` verbatim when ≤8 chars (e.g. `Claude`, `Kiro`, `Codex`, `Qwen`), otherwise fall back to `UPPER(alias)` (e.g. `GitHub Models` → `GHM`, `Gemini` → `GEMINI`). Idempotent. Combos intentionally skipped (the `Combo: ` prefix already conveys multi-upstream). |
 | `usableOnly`          | `boolean` | `false` | Read `/api/providers` and filter the catalog to providers that have at least one connection with `isActive: true` AND `testStatus: 'active'`. Subtract-filter semantics: providers unknown to BOTH the pricing-models catalog AND the connection table pass through (so synthetic prefixes like `agentrouter/*` survive). On fetch failure the filter is disabled for the refresh — never hides the whole catalog.                                                                                                                                                           |
 | `diskCache`           | `boolean` | `true`  | Persist the last successful `/v1/models` + `/api/combos` + enrichment + connections + compression snapshot to `${OPENCODE_DATA_DIR ?? ~/.local/share/opencode}/plugins/omniroute-<providerId>.json`. On a subsequent cold start where `/v1/models` throws (network down / IP whitelist drop / 5xx) the static block hydrates from the snapshot so OC's model picker survives offline. Soft-fail on read/write — never blocks publishing.                                                                                                                                     |
 | `geminiSanitization`  | `boolean` | `true`  | Strip `$schema`/`$ref`/`additionalProperties` from tool params when the model id matches `gemini`                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |

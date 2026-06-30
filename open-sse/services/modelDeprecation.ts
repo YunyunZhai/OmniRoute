@@ -18,8 +18,12 @@ const BUILT_IN_ALIASES: Record<string, string> = {
   "gemini-1.5-flash": "gemini-2.5-flash",
   "gemini-1.0-pro": "gemini-2.5-pro",
   "gemini-2.0-flash": "gemini-2.5-flash",
+  "gemini-2.0-flash-lite": "gemini-3.1-flash-lite",
+  "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
   "gemini-3-pro-high": "gemini-3.1-pro-high",
   "gemini-3-pro-low": "gemini-3.1-pro-low",
+  // Retired free Gemma (was in the gemini-free pool) → current gemini-free model
+  "gemma-4": "gemini-3.1-flash-lite",
 
   // Claude legacy → current
   "claude-3-opus-20240229": "claude-opus-4-20250514",
@@ -46,6 +50,8 @@ const BUILT_IN_ALIASES: Record<string, string> = {
   "mistral-large": "mistral-large-latest",
   "mistral-small": "mistral-small-latest",
   codestral: "codestral-latest",
+  // Sweep 2026-06-19: codestral-2405 retired 2025-06-16 — forward to the current stable.
+  "codestral-2405": "codestral-2508",
 
   // Llama short aliases
   "llama-3.3": "llama-3.3-70b-versatile",

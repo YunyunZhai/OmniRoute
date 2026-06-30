@@ -2,6 +2,7 @@ import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
 import { CLAUDE_OAUTH_TOOL_PREFIX } from "../request/openai-to-claude.ts";
 import { hasToolCallShim, applyToolCallShimToBuffer } from "../helpers/toolCallShim.ts";
+import { appendToolCallArgumentDelta } from "../../utils/toolCallArguments.ts";
 
 // Helper: stop thinking block if started
 function stopThinkingBlock(state, results) {
@@ -192,23 +193,27 @@ export function openaiToClaudeResponse(chunk, state) {
         if (toolInfo) {
           // Always buffer the raw stream so shimmed tools can re-emit a
           // corrected JSON at stop time.
-          toolInfo.argBuffer = (toolInfo.argBuffer || "") + tc.function.arguments;
+          const existingArgs = toolInfo.argBuffer || "";
+          const nextArgs = appendToolCallArgumentDelta(existingArgs, tc.function.arguments);
+          let deltaStr = nextArgs.slice(existingArgs.length);
+          toolInfo.argBuffer = nextArgs;
 
-          if (toolInfo.shimmed) {
-            // Suppress passthrough; we emit one corrective delta at finish.
+          if (toolInfo.shimmed || !deltaStr) {
+            // Suppress passthrough for shimmed tools; emit one corrective delta at finish.
             continue;
           }
 
-          let deltaStr = tc.function.arguments;
-
-          // Fix #1852: Strip empty string and array placeholders from streaming tool arguments
-          if (deltaStr.includes('""') || deltaStr.includes("[]") || deltaStr.includes("[ ]")) {
-            deltaStr = deltaStr
-              .replace(/,"[a-zA-Z0-9_]+":""/g, "")
-              .replace(/"[a-zA-Z0-9_]+":"",/g, "")
-              .replace(/,"[a-zA-Z0-9_]+":\s*\[\s*\]/g, "")
-              .replace(/"[a-zA-Z0-9_]+":\s*\[\s*\],?/g, "");
-          }
+          // NOTE: The regex-based "Fix #1852" strip that previously ran here was
+          // removed in #4951. That strip matched patterns like `"key":""` and
+          // `"key":[]` to remove spurious placeholder fields that some models emit
+          // as noise. However, since #3762 the snapshot-dedup logic in
+          // appendToolCallArgumentDelta already collapses repeated/growing snapshots
+          // into a single delta, so noise-only chunks are naturally suppressed.
+          // More critically, the regex unconditionally deleted any field whose value
+          // happened to be "" or [], silently corrupting intentional empty-string or
+          // empty-array arguments (e.g. {"file_path":"","content":"text"} →
+          // {"content":"text"}). Emit deltaStr as-is; the Claude client parses the
+          // assembled partial_json fragments and tolerates unknown extra fields.
 
           results.push({
             type: "content_block_delta",

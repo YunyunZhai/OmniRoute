@@ -6,6 +6,12 @@ import { BaseExecutor, mergeUpstreamExtraHeaders, type ExecuteInput } from "./ba
 type JsonRecord = Record<string, unknown>;
 
 export const COMMAND_CODE_VERSION = process.env.COMMAND_CODE_VERSION?.trim() || "0.33.2";
+// Hard server-side ceiling enforced by Command Code's /alpha/generate endpoint:
+// any request with params.max_tokens > 200_000 is rejected with a 400
+// "Too big: expected number to be <=200000 at params.max_tokens". We only use
+// this to clamp a CLIENT-SUPPLIED max_tokens down to a value the endpoint will
+// accept; we never fabricate this number for requests that omit the field (see
+// clampMaxTokens / buildCommandCodeBody).
 const MAX_COMMAND_CODE_TOKENS = 200_000;
 const encoder = new TextEncoder();
 
@@ -95,7 +101,7 @@ function convertMessages(messages: unknown): { system: string; messages: unknown
     }
 
     if (role === "user") {
-      out.push({ role: "user", content: message.content ?? "" });
+      out.push({ role: "user", content: normalizeContentText(message.content) });
       continue;
     }
 
@@ -140,16 +146,70 @@ function convertMessages(messages: unknown): { system: string; messages: unknown
   return { system: system.join("\n\n"), messages: out };
 }
 
-function clampMaxTokens(value: unknown): number {
-  const numeric = numberValue(value) ?? MAX_COMMAND_CODE_TOKENS;
-  return Math.max(1, Math.min(Math.floor(numeric), MAX_COMMAND_CODE_TOKENS));
+// Clamp a client-supplied max_tokens to the endpoint ceiling, mirroring the
+// provider-driven clamp in antigravity.ts: we only intervene when the value is
+// present, positive AND would otherwise be rejected (> 200_000). A valid value
+// is returned floored; anything absent, non-numeric or non-positive returns
+// undefined so the caller can OMIT the field entirely and let Command Code's
+// upstream apply the model's own native default (rather than us inventing a
+// number). A non-positive value such as Zoo Code's max_tokens:-1 ("let the
+// server choose") must be omitted, NOT forced to 1 — the old Math.max(1,...)
+// truncated output to a single token (#5166).
+function clampMaxTokens(value: unknown): number | undefined {
+  const numeric = numberValue(value);
+  if (numeric === undefined || numeric <= 0) return undefined;
+  return Math.min(Math.floor(numeric), MAX_COMMAND_CODE_TOKENS);
 }
+
+// Reasoning/thinking fields that payload rules or clients may inject and that
+// CommandCode's upstream accepts inside `params`. Without this pass-through,
+// payload-rule overrides on these fields are silently dropped (#2986 follow-up).
+const COMMAND_CODE_PASSTHROUGH_FIELDS = [
+  "reasoning_effort",
+  "reasoning",
+  "thinking",
+  "effort",
+  "output_config",
+  "extra_body",
+] as const;
 
 function buildCommandCodeBody(model: string, body: unknown, stream = false): JsonRecord {
   const input = isRecord(body) ? body : {};
   const converted = convertMessages(input.messages);
   const explicitSystem = typeof input.system === "string" ? input.system : "";
   const system = [converted.system, explicitSystem].filter(Boolean).join("\n\n");
+
+  // Payload rules may rewrite `body.model` (e.g. deepseek-v4-pro-max →
+  // deepseek/deepseek-v4-pro for the command-code provider). Prefer the
+  // rewritten value if present; fall back to the resolved combo model arg.
+  const resolvedModel =
+    typeof input.model === "string" && input.model.trim().length > 0 ? input.model : model;
+
+  const params: JsonRecord = {
+    model: resolvedModel,
+    messages: converted.messages,
+    tools: convertTools(input.tools),
+    system,
+    stream: true,
+  };
+
+  // Only forward max_tokens when the client actually supplied one. Omitting it
+  // lets Command Code's upstream apply the model's own native default, so we
+  // never invent a value (the old behavior, which sent the wrong number and got
+  // DeepSeek V4 rejected with "Too big: expected number to be <=200000"). When
+  // present, it is clamped to the endpoint ceiling so an oversized client value
+  // degrades gracefully instead of 400ing.
+  const maxTokens = clampMaxTokens(input.max_tokens ?? input.max_completion_tokens);
+  if (maxTokens !== undefined) {
+    params.max_tokens = maxTokens;
+  }
+
+  for (const field of COMMAND_CODE_PASSTHROUGH_FIELDS) {
+    const value = input[field];
+    if (value !== undefined && value !== null) {
+      params[field] = value;
+    }
+  }
 
   return {
     config: {
@@ -167,14 +227,7 @@ function buildCommandCodeBody(model: string, body: unknown, stream = false): Jso
     taste: "",
     skills: "",
     permissionMode: "standard",
-    params: {
-      model,
-      messages: converted.messages,
-      tools: convertTools(input.tools),
-      system,
-      max_tokens: clampMaxTokens(input.max_tokens ?? input.max_completion_tokens),
-      stream: true,
-    },
+    params,
   };
 }
 

@@ -21,6 +21,7 @@ export {
   // Provider Nodes
   getProviderNodes,
   getProviderNodeById,
+  resolveProviderNodeForConnection,
   createProviderNode,
   updateProviderNode,
   deleteProviderNode,
@@ -43,6 +44,7 @@ export {
   getModelAliases,
   setModelAlias,
   deleteModelAlias,
+  deleteModelAliasesForProvider,
 
   // MITM Alias
   getMitmAlias,
@@ -63,6 +65,7 @@ export {
   getModelUpstreamExtraHeaders,
   getModelIsHidden,
   setModelIsHidden,
+  getHiddenModelsByProvider,
 
   // Synced Available Models
   getSyncedAvailableModels,
@@ -80,6 +83,7 @@ export {
   getCombos,
   getComboById,
   getComboByName,
+  getComboByNameInsensitive,
   createCombo,
   updateCombo,
   reorderCombos,
@@ -88,6 +92,7 @@ export {
 
 export * from "./db/compressionCacheStats";
 export * from "./db/compressionCombos";
+export * from "./db/compressionRunTelemetry";
 
 export {
   // API Keys
@@ -200,7 +205,9 @@ export {
   backupDbFile,
   cleanupDbBackups,
   getDbBackupMaxFiles,
+  setDbBackupMaxFiles,
   getDbBackupRetentionDays,
+  setDbBackupRetentionDays,
   listDbBackups,
   restoreDbBackup,
   // Export-All / Import helpers (#3500 slice 5)
@@ -317,6 +324,7 @@ export {
 } from "./db/quotaSnapshots";
 
 export * from "./db/sessionAccountAffinity";
+export * from "./db/quotaResetEvents";
 
 export type { QuotaSnapshotRow, ProviderUtilizationPoint } from "@/shared/types/utilization";
 
@@ -527,6 +535,7 @@ export {
   deleteFreeProxy,
   clearFreeProxiesBySource,
   getFreeProxyStats,
+  recordFreeProxySync,
 } from "./db/freeProxies";
 
 export type { FreeProxyRecord, FreeProxyStats } from "./db/freeProxies";
@@ -568,6 +577,13 @@ export {
   upsertAllocations,
   listAllocationsForApiKey,
 } from "./db/quotaPools";
+// Quota per-(key, model) caps — Group B Fase 3 #7
+export {
+  getModelCap,
+  listModelCaps,
+  setModelCap,
+  deleteModelCap,
+} from "./db/quotaModelCaps";
 
 export {
   // Quota Groups (B2)
@@ -635,6 +651,23 @@ export {
 export type { ApiKeyContextSource } from "./db/apiKeyContextSources";
 
 export { sumUsageTokensThisMonth } from "./db/usageSummary";
+
+export {
+  // Model Intelligence (task-fitness scores)
+  getModelIntelligence,
+  getModelIntelligenceBySource,
+  upsertModelIntelligence,
+  deleteModelIntelligence,
+  deleteExpiredIntelligence,
+  deleteModelIntelligenceBySource,
+  listModelIntelligence,
+  bulkUpsertModelIntelligence,
+  getResolvedTaskFitness,
+  setUserFitnessOverrideEntry,
+  deleteUserFitnessOverrideEntry,
+} from "./db/modelIntelligence";
+
+export type { ModelIntelligenceEntry } from "./db/modelIntelligence";
 
 export {
   getProviderMetrics,

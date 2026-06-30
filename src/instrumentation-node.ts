@@ -239,6 +239,17 @@ export async function registerNodejs(): Promise<void> {
 
   await import("@/lib/db/core").then(({ ensureDbInitialized }) => ensureDbInitialized());
 
+  // Storage-configured scheduled VACUUM (#4437): registers the timer from
+  // Settings > System & Storage and persists lastVacuumAt for the UI.
+  try {
+    const { initVacuumScheduler } = await import("@/lib/db/vacuumScheduler");
+    initVacuumScheduler();
+    console.log("[STARTUP] Scheduled VACUUM initialized (#4437)");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn("[STARTUP] Could not initialize vacuum scheduler (non-fatal):", msg);
+  }
+
   if (!isBackgroundServicesDisabled()) {
     try {
       const { bootstrapEmbeddedServices } = await import("@/lib/services/bootstrap");
@@ -258,13 +269,59 @@ export async function registerNodejs(): Promise<void> {
     }
 
     try {
-      const { autoRefreshDaemon } = await import(
-        "@omniroute/open-sse/services/autoRefreshDaemon"
-      );
+      const { autoRefreshDaemon } = await import("@omniroute/open-sse/services/autoRefreshDaemon");
       autoRefreshDaemon.start();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn("[STARTUP] Auto-refresh daemon failed to start (non-fatal):", msg);
+    }
+
+    // Proactive connection-cooldown recovery (#8): re-validate connections whose
+    // transient `rate_limited_until` window has elapsed OUTSIDE the request hot
+    // path, so the first request after a cooldown does not pay the probe latency.
+    // Lazy/self-recovery still happens in getProviderCredentials; this front-runs it.
+    try {
+      const { initConnectionRecoveryScheduler } = await import("@/lib/quota/connectionRecovery");
+      initConnectionRecoveryScheduler();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] Connection recovery scheduler failed to start (non-fatal):", msg);
+    }
+
+    try {
+      // Arena ELO sync: model intelligence from the Arena AI leaderboard, powering the
+      // Free Provider Rankings page. On by default; configurable from Dashboard Feature Flags.
+      // Non-blocking — the initial sync is fire-and-forget and never fatal.
+      const { initArenaEloSync } = await import("@/lib/arenaEloSync");
+      const started = await initArenaEloSync();
+      if (started) {
+        console.log("[STARTUP] Arena ELO sync initialized");
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] Arena ELO sync failed to start (non-fatal):", msg);
+    }
+
+    // Pricing sync: opt-in external pricing data (self-gated by PRICING_SYNC_ENABLED inside
+    // initPricingSync). Was only wired into the unused server-init.ts, so it never ran in the
+    // standalone runtime even when enabled. Non-blocking, never fatal.
+    try {
+      const { initPricingSync } = await import("@/lib/pricingSync");
+      await initPricingSync();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] Pricing sync failed to start (non-fatal):", msg);
+    }
+
+    // models.dev capability sync: opt-in via Settings > AI (self-gated by
+    // settings.modelsDevSyncEnabled inside initModelsDevSync). Previously had no caller at all,
+    // so the toggle was inert. Non-blocking, never fatal.
+    try {
+      const { initModelsDevSync } = await import("@/lib/modelsDevSync");
+      await initModelsDevSync();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] models.dev sync failed to start (non-fatal):", msg);
     }
   }
 }

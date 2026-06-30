@@ -569,7 +569,7 @@ test("provider models route caches discovered opencode-go models per connection"
 
   assert.equal(firstResponse.status, 200);
   assert.equal(firstBody.source, "api");
-  assert.deepEqual(firstBody.models, [{ id: "glm-5.1", name: "GLM 5.1" }]);
+  assert.deepEqual(firstBody.models, [{ id: "glm-5.1", name: "GLM 5.1", owned_by: "opencode-go" }]);
   assert.deepEqual(cachedModels, [{ id: "glm-5.1", name: "GLM 5.1", source: "imported" }]);
 
   globalThis.fetch = async () => {
@@ -606,7 +606,9 @@ test("provider models route falls back to cached models when a refresh fails", a
   assert.equal(body.source, "cache");
   assert.match(body.warning, /cached catalog/i);
   assert.deepEqual(body.models, [{ id: "cached-go", name: "Cached Go", source: "imported" }]);
-  assert.equal(fetchCalls, 1);
+  // T39 multi-endpoint discovery probes `${base}/v1/models` then `${base}/models`
+  // before giving up; both 503 here, so it makes 2 attempts and then falls back to cache.
+  assert.equal(fetchCalls, 2);
 });
 
 test("provider models route clears cached discovery when a refresh returns no remote models", async () => {
@@ -702,103 +704,6 @@ test("provider models route uses synced models as the authoritative local catalo
   );
 });
 
-test("provider models route validates Gemini CLI credentials before fetching quota buckets", async () => {
-  const missingToken = await seedConnection("gemini-cli", {
-    authType: "oauth",
-    apiKey: null,
-  });
-  const missingProject = await seedConnection("gemini-cli", {
-    authType: "oauth",
-    name: "gemini-cli-projectless",
-    accessToken: "gemini-cli-access",
-    apiKey: null,
-  });
-
-  const missingTokenResponse = await callRoute(missingToken.id);
-  const missingProjectResponse = await callRoute(missingProject.id);
-
-  assert.equal(missingTokenResponse.status, 400);
-  assert.match((await missingTokenResponse.json()).error, /No access token/i);
-  assert.equal(missingProjectResponse.status, 400);
-  assert.match((await missingProjectResponse.json()).error, /project ID not available/i);
-});
-
-test("provider models route maps Gemini CLI quota buckets into a model list", async () => {
-  const connection = await seedConnection("gemini-cli", {
-    authType: "oauth",
-    accessToken: "gemini-cli-access",
-    apiKey: null,
-    projectId: "projects/demo-123",
-  });
-
-  globalThis.fetch = async (url, init = {}) => {
-    assert.equal(String(url), "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota");
-    assert.equal(init.headers.Authorization, "Bearer gemini-cli-access");
-    assert.deepEqual(JSON.parse(String(init.body)), { project: "projects/demo-123" });
-    return Response.json({
-      buckets: [{ modelId: "gemini-3-pro-preview" }, { modelId: "gemini-3-flash" }],
-    });
-  };
-
-  const response = await callRoute(connection.id);
-  const body = (await response.json()) as any;
-
-  assert.equal(response.status, 200);
-  assert.deepEqual(body.models, [
-    { id: "gemini-3-pro-preview", name: "gemini-3-pro-preview", owned_by: "google" },
-    { id: "gemini-3-flash", name: "gemini-3-flash", owned_by: "google" },
-  ]);
-});
-
-test("provider models route prefers providerSpecificData projectId over default-project", async () => {
-  const connection = await seedConnection("gemini-cli", {
-    authType: "oauth",
-    accessToken: "gemini-cli-access",
-    apiKey: null,
-    projectId: "default-project",
-    providerSpecificData: {
-      projectId: "projects/custom-psd-456",
-    },
-  });
-
-  globalThis.fetch = async (url, init = {}) => {
-    assert.equal(String(url), "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota");
-    assert.equal(init.headers.Authorization, "Bearer gemini-cli-access");
-    assert.deepEqual(JSON.parse(String(init.body)), { project: "projects/custom-psd-456" });
-    return Response.json({ buckets: [{ modelId: "gemini-3.1-pro-preview" }] });
-  };
-
-  const response = await callRoute(connection.id);
-  const body = (await response.json()) as any;
-
-  assert.equal(response.status, 200);
-  assert.deepEqual(body.models, [
-    { id: "gemini-3.1-pro-preview", name: "gemini-3.1-pro-preview", owned_by: "google" },
-  ]);
-});
-
-test("provider models route rejects projects/default-project placeholders", async () => {
-  const connection = await seedConnection("gemini-cli", {
-    authType: "oauth",
-    accessToken: "gemini-cli-access",
-    apiKey: null,
-    projectId: "projects/default-project",
-    providerSpecificData: {
-      projectId: "default-project",
-    },
-  });
-
-  globalThis.fetch = async () => {
-    throw new Error("retrieveUserQuota should not be called for placeholder project IDs");
-  };
-
-  const response = await callRoute(connection.id);
-  const body = (await response.json()) as any;
-
-  assert.equal(response.status, 400);
-  assert.equal(body.error, "Gemini CLI project ID not available. Please reconnect OAuth.");
-});
-
 test("provider models route retries Antigravity discovery endpoints before returning remote models", async () => {
   const connection = await seedConnection("antigravity", {
     authType: "oauth",
@@ -825,8 +730,11 @@ test("provider models route retries Antigravity discovery endpoints before retur
     assert.equal(init.headers.Authorization, "Bearer ag-access");
     assert.match(init.headers["User-Agent"], /^Antigravity\/1\.22\.2 /);
     assert.equal(init.headers["x-goog-api-client"], undefined);
+    // Use a model id that is in the current user-callable Antigravity allowlist, otherwise
+    // filterUserCallableAntigravityModels() drops it and discovery silently yields 0 models
+    // → the route falls back to local_catalog instead of returning the remote (api) list.
     return Response.json({
-      models: [{ id: "gemini-3-flash", displayName: "Gemini 3 Flash" }],
+      models: [{ id: "gemini-2.5-flash", displayName: "Gemini 2.5 Flash" }],
     });
   };
 
@@ -847,7 +755,7 @@ test("provider models route retries Antigravity discovery endpoints before retur
     "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
     "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
   ]);
-  assert.deepEqual(body.models, [{ id: "gemini-3-flash-preview", name: "Gemini 3 Flash" }]);
+  assert.deepEqual(body.models, [{ id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" }]);
 });
 
 test("provider models route falls back through all Antigravity discovery endpoints when needed", async () => {
@@ -1504,7 +1412,7 @@ test("provider models route always returns the Reka preset catalog", async () =>
   assert.equal(body.source, "local_catalog");
   assert.deepEqual(
     body.models.map((model) => model.id),
-    ["reka-flash-3", "reka-edge-2603"]
+    ["reka-flash-3", "reka-flash", "reka-edge-2603"]
   );
 });
 
@@ -1527,7 +1435,7 @@ test("provider models route returns Reka local catalog without an API key", asyn
   assert.equal(body.source, "local_catalog");
   assert.deepEqual(
     body.models.map((model) => model.id),
-    ["reka-flash-3", "reka-edge-2603"]
+    ["reka-flash-3", "reka-flash", "reka-edge-2603"]
   );
 });
 

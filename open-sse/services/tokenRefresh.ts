@@ -4,7 +4,7 @@ import { PROVIDERS, OAUTH_ENDPOINTS } from "../config/constants.ts";
 import { getGitHubCopilotRefreshHeaders } from "../config/providerHeaderProfiles.ts";
 import { pbkdf2Sync } from "node:crypto";
 import { runWithProxyContext } from "../utils/proxyFetch.ts";
-import { serializeRefresh } from "./refreshSerializer.ts";
+import { serializeRefresh, wasRefreshTokenRotated } from "./refreshSerializer.ts";
 import { WINDSURF_CONFIG } from "@/lib/oauth/constants/oauth";
 import { buildGitLabOAuthEndpoints, resolveGitLabOAuthBaseUrl } from "@/lib/oauth/gitlab";
 
@@ -43,16 +43,28 @@ export const REFRESH_LEAD_MS: Record<string, number> = {
   iflow: 24 * 60 * 60 * 1000, // 24 hours
   // Google OAuth refresh_tokens are permanent (non-rotating) — longer lead
   // is safe and reduces unnecessary upstream chatter.
-  "gemini-cli": 15 * 60 * 1000,
   antigravity: 15 * 60 * 1000,
   agy: 15 * 60 * 1000, // same Google backend as antigravity (non-rotating refresh tokens)
 };
 
 /**
  * Get the proactive refresh lead time (ms) for a given provider.
- * Falls back to TOKEN_EXPIRY_BUFFER_MS (5 min) when not explicitly listed.
+ *
+ * Precedence:
+ *   1. A per-connection override in `providerSpecificData.refreshLeadMs`
+ *      (must be a positive finite number), so an operator can tune the lead
+ *      time for a single connection without touching the provider defaults.
+ *   2. The provider default from REFRESH_LEAD_MS.
+ *   3. TOKEN_EXPIRY_BUFFER_MS (5 min) when nothing else applies.
  */
-export function getRefreshLeadMs(provider: string): number {
+export function getRefreshLeadMs(
+  provider: string,
+  providerSpecificData?: { refreshLeadMs?: unknown } | null
+): number {
+  const override = providerSpecificData?.refreshLeadMs;
+  if (typeof override === "number" && Number.isFinite(override) && override > 0) {
+    return override;
+  }
   return REFRESH_LEAD_MS[provider] ?? TOKEN_EXPIRY_BUFFER_MS;
 }
 
@@ -159,6 +171,81 @@ export function getActiveOnPersist(): RefreshPersistFn | undefined {
   return onPersistStore.getStore();
 }
 
+// ── #4038: compare-and-swap (CAS) guard on the refresh persist ───────────────
+// Fix A makes [network refresh + DB write] atomic *for a single connection's
+// mutex*. It does NOT protect against a THIRD writer (a sibling process, a
+// concurrent HealthCheck, or a replica) landing a fresher rotation on the same
+// `connection_id` between the moment the caller read the row and the moment this
+// persist runs. Overwriting that fresher row reverts the sibling's rotation, the
+// next caller loads the reverted (now-consumed) refresh_token, and Auth0/Anthropic
+// revoke the whole token family (the 1352× claude/aa5dd5cf invalidation storm).
+//
+// The CAS guard carries the refresh_token the caller PRESENTED (the version token,
+// since refresh_tokens rotate on every refresh) plus a `reread` of the row's
+// current refresh_token. Right before persisting, `getAccessToken` re-reads and, if
+// a concurrent writer already rotated the row past the presented token, SKIPS the
+// persist so the DB stays at the fresher state. The caller still receives the new
+// accessToken — upstream already authenticated the request; only the DB write is
+// skipped. No active guard ⇒ behavior is byte-identical to before (opt-in).
+type CasGuard = {
+  /** The refresh_token the caller presented for this refresh (CAS version token). */
+  expectedRefreshToken: string | null;
+  /** Re-reads the CURRENT persisted refresh_token for this connection (decrypted). */
+  reread: () => Promise<string | null | undefined>;
+};
+const casGuardStore = new AsyncLocalStorage<CasGuard>();
+const casGuardStats = { skipped: 0, persisted: 0 };
+
+export function runWithCasGuard<T>(
+  guard: CasGuard | undefined | null,
+  fn: () => Promise<T>
+): Promise<T> {
+  if (!guard) return fn();
+  return casGuardStore.run(guard, fn);
+}
+
+export function getActiveCasGuard(): CasGuard | undefined {
+  return casGuardStore.getStore();
+}
+
+/** Skip/persist counters for observability + tests. */
+export function getCasGuardStats(): { skipped: number; persisted: number } {
+  return { ...casGuardStats };
+}
+
+/** Test-only: reset the CAS counters between cases. */
+export function _resetCasGuardStats(): void {
+  casGuardStats.skipped = 0;
+  casGuardStats.persisted = 0;
+}
+
+/**
+ * Returns true when the persist should be SKIPPED because a concurrent writer
+ * already rotated the row's refresh_token past the one we presented (CAS mismatch).
+ * Best-effort: any reread failure falls through to persist (never blocks recovery).
+ */
+async function casGuardShouldSkipPersist(log?: RefreshLogger): Promise<boolean> {
+  const guard = getActiveCasGuard();
+  if (!guard || !guard.expectedRefreshToken) return false;
+  let current: string | null | undefined;
+  try {
+    current = await guard.reread();
+  } catch {
+    return false; // reread failed — fall through to persist (best-effort)
+  }
+  // wasRefreshTokenRotated is true iff both are non-empty AND current !== expected.
+  if (wasRefreshTokenRotated(guard.expectedRefreshToken, current)) {
+    casGuardStats.skipped++;
+    log?.warn?.(
+      "TOKEN_REFRESH",
+      "CAS guard: skipping persist — a concurrent writer already rotated the refresh_token (#4038)"
+    );
+    return true;
+  }
+  casGuardStats.persisted++;
+  return false;
+}
+
 type RefreshLogger = {
   info?: (tag: string, message: string, data?: Record<string, unknown>) => void;
   warn?: (tag: string, message: string, data?: Record<string, unknown>) => void;
@@ -179,6 +266,93 @@ function buildFormParams(entries: Record<string, unknown>): URLSearchParams {
 function getRefreshCacheKey(provider, refreshToken) {
   const tokenHash = pbkdf2Sync(refreshToken, CACHE_SECRET, 1000, 32, "sha256").toString("hex");
   return `${provider}:${tokenHash}`;
+}
+
+/**
+ * OAuth2 error codes that mean the refresh token is permanently dead and
+ * retrying will never succeed → callers must emit the unrecoverable sentinel
+ * so the HealthCheck deactivates the account instead of looping every 60s.
+ * Deliberately EXCLUDES transient codes (server_error, temporarily_unavailable,
+ * slow_down) so we never deactivate an account over a recoverable blip.
+ */
+const UNRECOVERABLE_OAUTH_ERROR_CODES = new Set([
+  "invalid_grant",
+  "invalid_request",
+  "refresh_token_reused",
+  "invalid_token",
+  "expired_token",
+  "unauthorized_client",
+  "access_denied",
+]);
+
+/**
+ * Extract a canonical OAuth error code from a refresh-endpoint error body of
+ * ANY shape. Production proxies/MITMs deliver the same `invalid_grant` 400 in
+ * several shapes — a plain object `{error:"invalid_grant"}`, a nested
+ * `{error:{code:"invalid_grant"}}`, a JSON **string** (double-encoded body),
+ * or the raw JSON text wrapped as `{error:"<json text>"}` by a catch branch.
+ * The old `errorBody.error === "invalid_grant"` only matched the first shape,
+ * so the others returned `null` → the HealthCheck refresh loop (root cause of
+ * the 1352× claude/aa5dd5cf invalidation storm).
+ *
+ * Returns the matched code (only if it is in UNRECOVERABLE_OAUTH_ERROR_CODES)
+ * or null. Never matches loosely — a known code is accepted only when it is a
+ * bare code string or the value of an `"error"`/`"error_code"` field, so a 502
+ * HTML page or a `server_error` body never becomes a false positive.
+ */
+export function extractOAuthErrorCode(raw: unknown, depth = 0): string | null {
+  if (raw == null || depth > 6) return null;
+
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    if (!s) return null;
+    if (UNRECOVERABLE_OAUTH_ERROR_CODES.has(s)) return s;
+    // The string may itself be JSON (a double-encoded body, or the raw text).
+    if (s[0] === "{" || s[0] === "[" || s[0] === '"') {
+      try {
+        const nested = extractOAuthErrorCode(JSON.parse(s), depth + 1);
+        if (nested) return nested;
+      } catch {
+        // not valid JSON — fall through to the field scan
+      }
+    }
+    // Safety net: a known code appearing as the value of an "error"/"error_code"
+    // field inside otherwise-unparsed text. Scoped to avoid false positives.
+    const m = s.match(/"error(?:_code)?"\s*:\s*"([a-z_]+)"/i);
+    if (m && UNRECOVERABLE_OAUTH_ERROR_CODES.has(m[1])) return m[1];
+    return null;
+  }
+
+  if (typeof raw === "object") {
+    const o = raw as Record<string, unknown>;
+    return (
+      extractOAuthErrorCode(o.error, depth + 1) ??
+      extractOAuthErrorCode(o.code, depth + 1) ??
+      extractOAuthErrorCode(o.error_code, depth + 1)
+    );
+  }
+
+  return null;
+}
+
+/**
+ * Read an error response body ONCE and classify it. Returns the raw text (for
+ * logging) and the extracted unrecoverable OAuth code (or null). Reading once
+ * avoids the double-read bug where `response.json()` consumes the stream and a
+ * later `response.text()` returns empty.
+ */
+async function readRefreshErrorBody(
+  response: Response
+): Promise<{ rawText: string; code: string | null }> {
+  const rawText = await response.text().catch(() => "");
+  let parsed: unknown = rawText;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    // keep rawText as-is
+  }
+  const code = extractOAuthErrorCode(parsed) ?? extractOAuthErrorCode(rawText);
+  return { rawText, code };
 }
 
 /**
@@ -229,6 +403,10 @@ export async function refreshAccessToken(
         status: response.status,
         error: errorText,
       });
+      const code = extractOAuthErrorCode(errorText);
+      if (code === "invalid_grant" || code === "invalid_request") {
+        return { error: "unrecoverable_refresh_error", code };
+      }
       return null;
     }
 
@@ -372,6 +550,72 @@ export async function refreshWindsurfToken(
   }
 }
 
+/**
+ * CodeBuddy CN (Tencent) token refresh — POST /v2/plugin/auth/token/refresh with
+ * the refresh token carried in the X-Refresh-Token header (not a form body),
+ * matching the official CodeBuddy CLI. Response: { code: 0, data: <token> }.
+ */
+export async function refreshCodebuddyCnToken(
+  refreshToken: string,
+  log: RefreshLogger,
+  proxyConfig: unknown = null
+) {
+  if (!refreshToken) return null;
+  const { CODEBUDDY_CN_CONFIG } = await import("@/lib/oauth/constants/oauth");
+  const oauth = CODEBUDDY_CN_CONFIG;
+  try {
+    const response = await runWithProxyContext(proxyConfig, () =>
+      fetch(oauth.refreshUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "User-Agent": oauth.userAgent,
+          "X-Requested-With": "XMLHttpRequest",
+          "X-Domain": "copilot.tencent.com",
+          "X-Refresh-Token": refreshToken,
+          "X-Auth-Refresh-Source": "plugin",
+          "X-Product": "SaaS",
+        },
+        body: "{}",
+      })
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      log?.error?.("TOKEN_REFRESH", "Failed to refresh CodeBuddy CN token", {
+        status: response.status,
+        error: errorText,
+      });
+      return null;
+    }
+
+    const data = await response.json();
+    if (data?.code !== 0 || !data?.data?.accessToken) {
+      log?.error?.("TOKEN_REFRESH", "CodeBuddy CN token refresh returned no token", {
+        code: data?.code,
+        msg: data?.msg,
+      });
+      return null;
+    }
+
+    log?.info?.("TOKEN_REFRESH", "Successfully refreshed CodeBuddy CN token", {
+      hasNewAccessToken: !!data.data.accessToken,
+      hasNewRefreshToken: !!data.data.refreshToken,
+      expiresIn: data.data.expiresIn,
+    });
+
+    return {
+      accessToken: data.data.accessToken,
+      refreshToken: data.data.refreshToken || refreshToken,
+      expiresIn: data.data.expiresIn,
+    };
+  } catch (error) {
+    log?.error?.("TOKEN_REFRESH", `Network error refreshing CodeBuddy CN token: ${error?.message}`);
+    return null;
+  }
+}
+
 export async function refreshClineToken(refreshToken, log, proxyConfig: unknown = null) {
   const endpoint = PROVIDERS.cline?.refreshUrl;
   if (!endpoint) {
@@ -401,6 +645,10 @@ export async function refreshClineToken(refreshToken, log, proxyConfig: unknown 
         status: response.status,
         error: errorText,
       });
+      const code = extractOAuthErrorCode(errorText);
+      if (code === "invalid_grant" || code === "invalid_request") {
+        return { error: "unrecoverable_refresh_error", code };
+      }
       return null;
     }
 
@@ -664,19 +912,17 @@ export async function refreshClaudeOAuthToken(refreshToken, log, proxyConfig: un
     );
 
     if (!response.ok) {
-      let errorBody: { error?: string; error_description?: string } = {};
-      try {
-        errorBody = await response.json();
-      } catch {
-        const text = await response.text().catch(() => "unknown");
-        errorBody = { error: text };
-      }
+      // Read + classify the body ONCE, shape-agnostic. A proxy/MITM can deliver
+      // the invalid_grant 400 as a JSON string, a double-encoded string, a
+      // nested {error:{code}}, or raw text — all must yield the sentinel so the
+      // HealthCheck deactivates instead of looping every 60s.
+      const { rawText, code } = await readRefreshErrorBody(response);
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Claude OAuth token", {
         status: response.status,
-        error: errorBody,
+        error: rawText.slice(0, 300),
       });
-      if (errorBody.error === "invalid_grant" || errorBody.error === "invalid_request") {
-        return { error: "unrecoverable_refresh_error", code: errorBody.error };
+      if (code === "invalid_grant" || code === "invalid_request") {
+        return { error: "unrecoverable_refresh_error", code };
       }
       return null;
     }
@@ -899,6 +1145,26 @@ export async function refreshCodexToken(refreshToken, log, proxyConfig: unknown 
           }
         );
         return { error: "unrecoverable_refresh_error", code: errorCode };
+      }
+
+      // Defense-in-depth (port from decolua/9router#1821): any 401 from OpenAI's
+      // OAuth token endpoint means the refresh credential itself was rejected
+      // (e.g. rotated away, or a payload variant whose code we do not yet
+      // recognize — OpenAI has shipped both `token_expired` and the bare
+      // "Could not validate your token" message). Retrying with the same dead
+      // refresh token will never succeed; surface re-auth instead of looping.
+      // 429 / 5xx remain transient and fall through to the retryable branch.
+      if (response.status === 401) {
+        const code = errorCode || "unauthorized";
+        log?.error?.(
+          "TOKEN_REFRESH",
+          "Codex OAuth token endpoint returned 401. Re-authentication required.",
+          {
+            status: response.status,
+            errorCode: code,
+          }
+        );
+        return { error: "unrecoverable_refresh_error", code };
       }
 
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Codex token", {
@@ -1186,6 +1452,10 @@ export async function refreshQoderToken(refreshToken, log, proxyConfig: unknown 
       status: response.status,
       error: errorText,
     });
+    const code = extractOAuthErrorCode(errorText);
+    if (code === "invalid_grant" || code === "invalid_request") {
+      return { error: "unrecoverable_refresh_error", code };
+    }
     return null;
   }
 
@@ -1230,6 +1500,10 @@ export async function refreshGitHubToken(refreshToken, log, proxyConfig: unknown
       status: response.status,
       error: errorText,
     });
+    const code = extractOAuthErrorCode(errorText);
+    if (code === "invalid_grant" || code === "invalid_request") {
+      return { error: "unrecoverable_refresh_error", code };
+    }
     return null;
   }
 
@@ -1293,7 +1567,6 @@ export async function refreshCopilotToken(githubAccessToken, log, proxyConfig: u
 async function _getAccessTokenInternal(provider, credentials, log, proxyConfig: unknown = null) {
   switch (provider) {
     case "gemini":
-    case "gemini-cli":
     case "antigravity":
     case "agy":
       return await refreshGoogleToken(
@@ -1356,6 +1629,9 @@ async function _getAccessTokenInternal(provider, credentials, log, proxyConfig: 
         proxyConfig
       );
 
+    case "codebuddy-cn":
+      return await refreshCodebuddyCnToken(credentials.refreshToken, log, proxyConfig);
+
     default:
       // Fallback to generic OAuth refresh for unknown providers
       return refreshAccessToken(provider, credentials.refreshToken, credentials, log, proxyConfig);
@@ -1368,7 +1644,6 @@ async function _getAccessTokenInternal(provider, credentials, log, proxyConfig: 
 export function supportsTokenRefresh(provider) {
   const explicitlySupported = new Set([
     "gemini",
-    "gemini-cli",
     "antigravity",
     "agy",
     "claude",
@@ -1383,6 +1658,7 @@ export function supportsTokenRefresh(provider) {
     "windsurf",
     "devin-cli",
     "gitlab-duo",
+    "codebuddy-cn",
   ]);
   if (explicitlySupported.has(provider)) return true;
   const config = PROVIDERS[provider];
@@ -1469,6 +1745,11 @@ export async function getAccessToken(
       // Invoke onPersist INSIDE the mutex so [network call + DB write] are one atomic step.
       // This prevents a concurrent waiter from reading stale credentials before the DB is updated.
       if (result?.accessToken && effectiveOnPersist) {
+        // #4038: skip the persist if a concurrent writer already rotated this row past the
+        // refresh_token we presented (compare-and-swap) — overwriting would revert it.
+        if (await casGuardShouldSkipPersist(log)) {
+          return result;
+        }
         try {
           await effectiveOnPersist(result);
         } catch (persistErr) {
@@ -1506,6 +1787,11 @@ export async function getAccessToken(
   )
     .then(async (result) => {
       if (result?.accessToken && effectiveOnPersist) {
+        // #4038: same compare-and-swap guard as Layer 1 — skip the persist if a concurrent
+        // writer already rotated this row past the refresh_token we presented.
+        if (await casGuardShouldSkipPersist(log)) {
+          return result;
+        }
         try {
           await effectiveOnPersist(result);
         } catch (persistErr) {
@@ -1683,7 +1969,6 @@ export function formatProviderCredentials(provider, credentials, log) {
 
     case "antigravity":
     case "agy":
-    case "gemini-cli":
       return {
         accessToken: credentials.accessToken,
         refreshToken: credentials.refreshToken,

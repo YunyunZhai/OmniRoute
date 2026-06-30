@@ -274,11 +274,10 @@ async function resetStorage() {
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
-// 10s ceiling: on 2-core CI runners under shard contention the 1500ms budget
-// expired mid-flight (observed: 1580ms fail on the upstream-timeout test) —
-// green runs return as soon as the condition holds, so the ceiling only
-// bounds the failure case.
-async function waitFor(fn, timeoutMs = 10000) {
+// 30s ceiling: c8 instrumentation plus --test-concurrency=8 can stall CI workers
+// well past the upstream timeout budget. Green runs return as soon as the condition
+// holds, so the ceiling only bounds the failure case.
+async function waitFor(fn, timeoutMs = 30000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     const result = await fn();
@@ -433,14 +432,13 @@ test("chatCore times out upstream execution before provider response headers", a
       userAgent: "unit-test",
     } as any);
 
-    const pendingDetail = (await waitFor(
-      () =>
-        // details[connectionId] is Record<modelKey, PendingRequestDetail[]> —
-        // the original predicate tested each ARRAY's .providerRequest (always
-        // undefined), so the waitFor could never resolve. Flatten to the details.
-        Object.values(getPendingRequests().details[connectionId] || {})
-          .flat()
-          .find((detail: any) => detail?.providerRequest?.model === "gpt-4o-mini")
+    const pendingDetail = (await waitFor(() =>
+      // details[connectionId] is Record<modelKey, PendingRequestDetail[]> —
+      // the original predicate tested each ARRAY's .providerRequest (always
+      // undefined), so the waitFor could never resolve. Flatten to the details.
+      Object.values(getPendingRequests().details[connectionId] || {})
+        .flat()
+        .find((detail: any) => detail?.providerRequest?.model === "gpt-4o-mini")
     )) as any;
     assert.equal(pendingDetail?.providerRequest?.model, "gpt-4o-mini");
     assert.deepEqual(pendingDetail?.providerRequest?.messages, body.messages);
@@ -501,7 +499,7 @@ test("chatCore keeps Responses-native Codex payloads in native passthrough mode"
 
   assert.equal(result.success, true);
   assert.match(call.url, /\/responses$/);
-  assert.equal(call.body.input, "ship it");
+  assert.deepEqual(call.body.input, [{ type: "message", role: "user", content: [{ type: "input_text", text: "ship it" }] }]);
   assert.equal(call.body.instructions, "custom system prompt");
   assert.equal(call.body.store, false);
   assert.deepEqual(call.body.metadata, { source: "codex-client" });
@@ -2297,7 +2295,13 @@ test("chatCore records Claude prompt cache and cache usage metadata in call logs
   });
 });
 
-test("chatCore serves emergency fallback responses for budget errors on non-streaming requests", async () => {
+test("chatCore propagates budget errors without an executor-level emergency hop", async () => {
+  // The emergency budget fallback is orchestrated by the routing layer
+  // (src/sse/handlers/chat.ts), which resolves credentials FOR the emergency
+  // provider through account selection. The old executor-level hop here re-sent
+  // the FAILING provider's credentials to the emergency provider's endpoint
+  // (cross-provider credential leak) — the engine must now surface the budget
+  // error as-is, with no extra upstream call.
   const { calls, result } = await invokeChatCore({
     provider: "openai",
     model: "gpt-4o-mini",
@@ -2307,30 +2311,28 @@ test("chatCore serves emergency fallback responses for budget errors on non-stre
       max_tokens: 9000,
       messages: [{ role: "user", content: "keep the request alive after budget exhaustion" }],
     },
-    responseFactory(_captured, seenCalls) {
-      if (seenCalls.length === 1) {
-        return new Response(
-          JSON.stringify({
-            error: { message: "insufficient funds on this account" },
-          }),
-          {
-            status: 402,
-            headers: { "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      return buildOpenAIResponse(false, "served by emergency fallback");
+    responseFactory() {
+      return new Response(
+        JSON.stringify({
+          error: { message: "insufficient funds on this account" },
+        }),
+        {
+          status: 402,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
     },
   });
 
-  const payload = (await result.response.json()) as any;
-
-  assert.equal(result.success, true);
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1].body.model, "openai/gpt-oss-120b");
-  assert.equal(calls[1].body.max_tokens, 4096);
-  assert.equal(payload.choices[0].message.content, "served by emergency fallback");
+  assert.equal(result.success, false);
+  assert.equal(result.status, 402);
+  assert.equal(calls.length, 1, "no executor-level emergency hop may fire");
+  const body = (await result.response.json()) as any;
+  assert.match(String(body?.error?.message ?? ""), /insufficient funds/);
+  assert.ok(
+    !calls.some((c: any) => String(c.body?.model ?? "").includes("gpt-oss-120b")),
+    "emergency fallback model must not be called at executor level"
+  );
 });
 
 test("chatCore injects progress events into streaming responses when requested", async () => {
@@ -2515,7 +2517,13 @@ test("chatCore returns streaming responses without waiting for upstream completi
 
   const raceResult = await Promise.race([
     invocation.then(() => "returned"),
-    new Promise((resolve) => setTimeout(() => resolve("blocked"), 1000)),
+    // 10s ceiling: a non-buffering streaming impl resolves the invocation as soon
+    // as the Response is returned (upstream still open), but on a starved CI event
+    // loop that legitimate early return can exceed a 1s wall-clock budget (flake
+    // repro: 5/8 runs returned at 1.3–2.2s under CPU contention → false "blocked").
+    // The ceiling only bounds the buffered-failure case: a buffering impl never
+    // resolves until closeUpstream() fires below, so it still trips "blocked".
+    new Promise((resolve) => setTimeout(() => resolve("blocked"), 10000)),
   ]);
 
   if (raceResult !== "returned") {

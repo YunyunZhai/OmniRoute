@@ -26,19 +26,21 @@ const {
   isRequireApiKeyEnabled,
   isCcCompatibleProviderEnabled,
   isModelCatalogNamesEnabled,
+  isArenaEloSyncEnabled,
+  isControlPlaneProxyDirectFallbackEnabled,
 } = await import("../../src/shared/utils/featureFlags.ts");
 
 // ──────────────────────────────────────────────────────
 // Test group 1 — Flag definitions registry
 // ──────────────────────────────────────────────────────
 describe("featureFlagDefinitions", () => {
-  it("has exactly 30 flag definitions", () => {
-    assert.strictEqual(FEATURE_FLAG_DEFINITIONS.length, 30);
+  it("has exactly 38 flag definitions", () => {
+    assert.strictEqual(FEATURE_FLAG_DEFINITIONS.length, 38);
   });
 
   it("has unique keys for all flags", () => {
     const keys = FEATURE_FLAG_DEFINITIONS.map((d) => d.key);
-    assert.strictEqual(new Set(keys).size, 30);
+    assert.strictEqual(new Set(keys).size, 38);
   });
 
   it("has valid categories for all flags", () => {
@@ -94,6 +96,67 @@ describe("featureFlagDefinitions", () => {
     assert.strictEqual(def.type, "boolean");
     assert.strictEqual(def.defaultValue, "true");
     assert.strictEqual(def.requiresRestart, false);
+  });
+
+  it("defines models catalog prefix mode as a runtime enum flag defaulting to dual", () => {
+    const def = FEATURE_FLAG_DEFINITIONS.find((d) => d.key === "MODELS_CATALOG_PREFIX_MODE");
+    assert.ok(def, "MODELS_CATALOG_PREFIX_MODE should exist");
+    assert.strictEqual(def.category, "runtime");
+    assert.strictEqual(def.type, "enum");
+    assert.deepStrictEqual(def.enumValues, ["dual", "alias", "canonical"]);
+    assert.strictEqual(def.defaultValue, "dual");
+    assert.strictEqual(def.requiresRestart, false);
+  });
+
+  it("defines Arena ELO sync as a runtime boolean flag enabled by default", () => {
+    const def = FEATURE_FLAG_DEFINITIONS.find((d) => d.key === "ARENA_ELO_SYNC_ENABLED");
+    assert.ok(def, "ARENA_ELO_SYNC_ENABLED should exist");
+    assert.strictEqual(def.category, "runtime");
+    assert.strictEqual(def.type, "boolean");
+    assert.strictEqual(def.defaultValue, "true");
+    assert.strictEqual(def.requiresRestart, false);
+  });
+
+  it("defines emergency fallback as a runtime boolean flag enabled by default", () => {
+    const def = FEATURE_FLAG_DEFINITIONS.find((d) => d.key === "OMNIROUTE_EMERGENCY_FALLBACK");
+    assert.ok(def, "OMNIROUTE_EMERGENCY_FALLBACK should exist");
+    assert.strictEqual(def.category, "runtime");
+    assert.strictEqual(def.type, "boolean");
+    assert.strictEqual(def.defaultValue, "true");
+    assert.strictEqual(def.requiresRestart, false);
+  });
+
+  it("defines stream recovery as runtime boolean flags disabled by default", () => {
+    const early = FEATURE_FLAG_DEFINITIONS.find((d) => d.key === "STREAM_RECOVERY_ENABLED");
+    const midstream = FEATURE_FLAG_DEFINITIONS.find(
+      (d) => d.key === "STREAM_RECOVERY_MIDSTREAM_ENABLED"
+    );
+
+    assert.ok(early, "STREAM_RECOVERY_ENABLED should exist");
+    assert.strictEqual(early.category, "runtime");
+    assert.strictEqual(early.type, "boolean");
+    assert.strictEqual(early.defaultValue, "false");
+    assert.strictEqual(early.requiresRestart, false);
+    assert.strictEqual(early.warningLevel, "caution");
+
+    assert.ok(midstream, "STREAM_RECOVERY_MIDSTREAM_ENABLED should exist");
+    assert.strictEqual(midstream.category, "runtime");
+    assert.strictEqual(midstream.type, "boolean");
+    assert.strictEqual(midstream.defaultValue, "false");
+    assert.strictEqual(midstream.requiresRestart, false);
+    assert.strictEqual(midstream.warningLevel, "danger");
+  });
+
+  it("defines control-plane proxy direct fallback as a network boolean flag disabled by default", () => {
+    const def = FEATURE_FLAG_DEFINITIONS.find(
+      (d) => d.key === "OMNIROUTE_CONTROL_PLANE_PROXY_DIRECT_FALLBACK"
+    );
+    assert.ok(def, "OMNIROUTE_CONTROL_PLANE_PROXY_DIRECT_FALLBACK should exist");
+    assert.strictEqual(def.category, "network");
+    assert.strictEqual(def.type, "boolean");
+    assert.strictEqual(def.defaultValue, "false");
+    assert.strictEqual(def.requiresRestart, false);
+    assert.strictEqual(def.warningLevel, "danger");
   });
 });
 
@@ -232,9 +295,9 @@ describe("resolveFeatureFlag", () => {
   });
 
   describe("resolveAllFeatureFlags", () => {
-    it("returns all 30 flags", () => {
+    it("returns all 38 flags", () => {
       const all = resolveAllFeatureFlags();
-      assert.strictEqual(all.length, 30);
+      assert.strictEqual(all.length, 38);
     });
 
     it("marks DB-overridden flags with source 'db'", () => {
@@ -297,6 +360,26 @@ describe("resolveFeatureFlag", () => {
         removeFeatureFlagOverride("MODEL_CATALOG_INCLUDE_NAMES");
       }
     });
+
+    it("isArenaEloSyncEnabled defaults on and follows DB overrides", () => {
+      assert.strictEqual(isArenaEloSyncEnabled(), true);
+      try {
+        setFeatureFlagOverride("ARENA_ELO_SYNC_ENABLED", "false");
+        assert.strictEqual(isArenaEloSyncEnabled(), false);
+      } finally {
+        removeFeatureFlagOverride("ARENA_ELO_SYNC_ENABLED");
+      }
+    });
+
+    it("isControlPlaneProxyDirectFallbackEnabled defaults off and follows DB overrides", () => {
+      assert.strictEqual(isControlPlaneProxyDirectFallbackEnabled(), false);
+      try {
+        setFeatureFlagOverride("OMNIROUTE_CONTROL_PLANE_PROXY_DIRECT_FALLBACK", "true");
+        assert.strictEqual(isControlPlaneProxyDirectFallbackEnabled(), true);
+      } finally {
+        removeFeatureFlagOverride("OMNIROUTE_CONTROL_PLANE_PROXY_DIRECT_FALLBACK");
+      }
+    });
   });
 });
 
@@ -333,5 +416,14 @@ describe("featureFlagUpdateSchema validation", () => {
       () => setFeatureFlagOverride("INJECTION_GUARD_MODE", "invalid_mode"),
       /Invalid value/
     );
+  });
+});
+
+describe("settings schema public surface", () => {
+  it("uses databaseSettingsSchema as the canonical database settings export", async () => {
+    const settingsSchemas = await import("../../src/shared/validation/settingsSchemas.ts");
+    assert.equal("DatabaseSettingsSchema" in settingsSchemas, false);
+    assert.equal("featureFlagUpdateSchema" in settingsSchemas, false);
+    assert.equal(typeof settingsSchemas.databaseSettingsSchema.safeParse, "function");
   });
 });

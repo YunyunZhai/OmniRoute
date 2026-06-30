@@ -1,5 +1,8 @@
-// Convention: when type === "vercel", the `notes` column stores JSON { relayAuth: "<token>" }
-// used by proxyFetch.ts to route requests through the Vercel edge relay instead of an undici ProxyAgent.
+// Convention: when type is a relay (vercel | deno | cloudflare), the `notes` column stores JSON
+// { relayAuth: "<token>" } used by proxyFetch.ts to route requests through the relay edge function
+// (Vercel Edge, Deno Deploy, or Cloudflare Workers) instead of an undici ProxyAgent. All relay
+// types share the exact same x-relay-target / x-relay-path / x-relay-auth header spec; only the
+// deployment surface differs.
 import { randomUUID } from "crypto";
 import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
@@ -20,6 +23,7 @@ interface ProxyRegistryRecord {
   notes: string | null;
   status: string;
   source: string;
+  family: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -44,6 +48,7 @@ interface ProxyPayload {
   notes?: string | null;
   status?: string;
   source?: string;
+  family?: string;
 }
 
 interface ProxyAssignmentPayload {
@@ -97,6 +102,7 @@ function mapProxyRow(row: unknown): ProxyRegistryRecord {
     notes: typeof r.notes === "string" ? r.notes : null,
     status: typeof r.status === "string" ? r.status : "active",
     source: typeof r.source === "string" ? r.source : "manual",
+    family: typeof r.family === "string" ? r.family : "auto",
     createdAt: typeof r.created_at === "string" ? r.created_at : "",
     updatedAt: typeof r.updated_at === "string" ? r.updated_at : "",
   };
@@ -116,7 +122,16 @@ function mapAssignmentRow(row: unknown): ProxyAssignmentRecord {
   };
 }
 
-function extractRelayAuth(notes: unknown): string | undefined {
+// Edge-relay proxy types. Mirrors RELAY_TYPES in open-sse/utils/proxyDispatcher.
+// Duplicated here (not imported) to keep src/lib/db/ free of open-sse runtime
+// imports; if a third relay backend lands, update BOTH sets.
+const RELAY_PROXY_TYPES = new Set(["vercel", "deno", "cloudflare"]);
+
+function isRelayProxyType(type: unknown): boolean {
+  return typeof type === "string" && RELAY_PROXY_TYPES.has(type);
+}
+
+export function extractRelayAuth(notes: unknown): string | undefined {
   if (typeof notes !== "string") return undefined;
   try {
     const parsed = JSON.parse(notes) as {
@@ -138,7 +153,7 @@ function extractRelayAuth(notes: unknown): string | undefined {
 
 function toRegistryProxyResolution(row: unknown, level: ProxyScope, levelId: string | null) {
   const record = toRecord(row);
-  const relayAuth = record.type === "vercel" ? extractRelayAuth(record.notes) : undefined;
+  const relayAuth = isRelayProxyType(record.type) ? extractRelayAuth(record.notes) : undefined;
   return {
     proxy: {
       type: record.type,
@@ -146,6 +161,7 @@ function toRegistryProxyResolution(row: unknown, level: ProxyScope, levelId: str
       port: record.port,
       username: record.username,
       password: record.password,
+      family: typeof record.family === "string" ? record.family : "auto",
       ...(relayAuth !== undefined ? { relayAuth } : {}),
     },
     level,
@@ -243,8 +259,8 @@ function insertProxyRow(
 ) {
   db.prepare(
     `INSERT INTO proxy_registry
-      (id, name, type, host, port, username, password, region, notes, status, source, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      (id, name, type, host, port, username, password, region, notes, status, source, family, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     payload.name,
@@ -257,6 +273,7 @@ function insertProxyRow(
     payload.notes || null,
     payload.status || "active",
     payload.source || "manual",
+    payload.family || "auto",
     now,
     now
   );
@@ -285,7 +302,7 @@ function updateProxyRow(
 
   db.prepare(
     `UPDATE proxy_registry
-       SET name = ?, type = ?, host = ?, port = ?, username = ?, password = ?, region = ?, notes = ?, status = ?, source = ?, updated_at = ?
+       SET name = ?, type = ?, host = ?, port = ?, username = ?, password = ?, region = ?, notes = ?, status = ?, source = ?, family = ?, updated_at = ?
      WHERE id = ?`
   ).run(
     merged.name,
@@ -298,6 +315,7 @@ function updateProxyRow(
     merged.notes || null,
     merged.status || "active",
     merged.source || "manual",
+    merged.family || "auto",
     merged.updatedAt,
     id
   );
@@ -377,7 +395,7 @@ function coerceProxyPayload(value: unknown, fallbackName: string): ProxyPayload 
 
 export function redactProxySecrets(proxy: ProxyRegistryRecord): ProxyRegistryRecord {
   let redactedNotes = proxy.notes;
-  if (proxy.type === "vercel" && proxy.notes) {
+  if (isRelayProxyType(proxy.type) && proxy.notes) {
     try {
       const parsed = JSON.parse(proxy.notes);
       if (parsed && typeof parsed === "object") {
@@ -412,7 +430,7 @@ export async function listProxies(options?: { includeSecrets?: boolean }) {
   const db = getDbInstance();
   const rows = db
     .prepare(
-      "SELECT id, name, type, host, port, username, password, region, notes, status, source, created_at, updated_at FROM proxy_registry ORDER BY datetime(updated_at) DESC, name ASC"
+      "SELECT id, name, type, host, port, username, password, region, notes, status, source, family, created_at, updated_at FROM proxy_registry ORDER BY datetime(updated_at) DESC, name ASC"
     )
     .all();
 
@@ -433,7 +451,7 @@ function getProxyRowById(
   const includeSecrets = options?.includeSecrets === true;
   const row = db
     .prepare(
-      "SELECT id, name, type, host, port, username, password, region, notes, status, source, created_at, updated_at FROM proxy_registry WHERE id = ?"
+      "SELECT id, name, type, host, port, username, password, region, notes, status, source, family, created_at, updated_at FROM proxy_registry WHERE id = ?"
     )
     .get(id);
   if (!row) return null;
@@ -694,18 +712,26 @@ export async function deleteProxyById(id: string, options?: { force?: boolean })
   return result.changes > 0;
 }
 
+// A proxy is "alive" for resolution unless it has been explicitly marked dead
+// (by an operator or a health check). Conservative: active/null/unknown stay
+// usable so a working proxy is never stranded; only known-dead states are
+// excluded so a dead proxy stops being handed out (every request would
+// otherwise pay the timeout or leak out the host IP).
+const PROXY_ALIVE_PREDICATE =
+  "(p.status IS NULL OR LOWER(p.status) NOT IN ('inactive','error','disabled','dead','down'))";
+
 export async function resolveProxyForConnectionFromRegistry(connectionId: string) {
   try {
     const db = getDbInstance();
 
     const accountAssignment = db
       .prepare(
-        "SELECT p.id, p.type, p.host, p.port, p.username, p.password, p.notes FROM proxy_assignments a JOIN proxy_registry p ON p.id = a.proxy_id WHERE a.scope = 'account' AND a.scope_id = ? LIMIT 1"
+        `SELECT p.id, p.type, p.host, p.port, p.username, p.password, p.notes, p.family FROM proxy_assignments a JOIN proxy_registry p ON p.id = a.proxy_id WHERE a.scope = 'account' AND a.scope_id = ? AND ${PROXY_ALIVE_PREDICATE} LIMIT 1`
       )
       .get(connectionId);
     if (accountAssignment) {
       const record = toRecord(accountAssignment);
-      const relayAuth = record.type === "vercel" ? extractRelayAuth(record.notes) : undefined;
+      const relayAuth = isRelayProxyType(record.type) ? extractRelayAuth(record.notes) : undefined;
       return {
         proxy: {
           type: record.type,
@@ -713,6 +739,7 @@ export async function resolveProxyForConnectionFromRegistry(connectionId: string
           port: record.port,
           username: record.username,
           password: record.password,
+          family: typeof record.family === "string" ? record.family : "auto",
           ...(relayAuth !== undefined ? { relayAuth } : {}),
         },
         level: "account",
@@ -728,12 +755,12 @@ export async function resolveProxyForConnectionFromRegistry(connectionId: string
     if (connection?.provider) {
       const providerAssignment = db
         .prepare(
-          "SELECT p.id, p.type, p.host, p.port, p.username, p.password, p.notes FROM proxy_assignments a JOIN proxy_registry p ON p.id = a.proxy_id WHERE a.scope = 'provider' AND a.scope_id = ? LIMIT 1"
+          `SELECT p.id, p.type, p.host, p.port, p.username, p.password, p.notes, p.family FROM proxy_assignments a JOIN proxy_registry p ON p.id = a.proxy_id WHERE a.scope = 'provider' AND a.scope_id = ? AND ${PROXY_ALIVE_PREDICATE} LIMIT 1`
         )
         .get(connection.provider);
       if (providerAssignment) {
         const record = toRecord(providerAssignment);
-        const relayAuth = record.type === "vercel" ? extractRelayAuth(record.notes) : undefined;
+        const relayAuth = isRelayProxyType(record.type) ? extractRelayAuth(record.notes) : undefined;
         return {
           proxy: {
             type: record.type,
@@ -741,6 +768,7 @@ export async function resolveProxyForConnectionFromRegistry(connectionId: string
             port: record.port,
             username: record.username,
             password: record.password,
+            family: typeof record.family === "string" ? record.family : "auto",
             ...(relayAuth !== undefined ? { relayAuth } : {}),
           },
           level: "provider",
@@ -752,12 +780,12 @@ export async function resolveProxyForConnectionFromRegistry(connectionId: string
 
     const globalAssignment = db
       .prepare(
-        "SELECT p.id, p.type, p.host, p.port, p.username, p.password, p.notes FROM proxy_assignments a JOIN proxy_registry p ON p.id = a.proxy_id WHERE a.scope = 'global' LIMIT 1"
+        `SELECT p.id, p.type, p.host, p.port, p.username, p.password, p.notes, p.family FROM proxy_assignments a JOIN proxy_registry p ON p.id = a.proxy_id WHERE a.scope = 'global' AND ${PROXY_ALIVE_PREDICATE} LIMIT 1`
       )
       .get();
     if (globalAssignment) {
       const record = toRecord(globalAssignment);
-      const relayAuth = record.type === "vercel" ? extractRelayAuth(record.notes) : undefined;
+      const relayAuth = isRelayProxyType(record.type) ? extractRelayAuth(record.notes) : undefined;
       return {
         proxy: {
           type: record.type,
@@ -765,6 +793,7 @@ export async function resolveProxyForConnectionFromRegistry(connectionId: string
           port: record.port,
           username: record.username,
           password: record.password,
+          family: typeof record.family === "string" ? record.family : "auto",
           ...(relayAuth !== undefined ? { relayAuth } : {}),
         },
         level: "global",
@@ -789,7 +818,7 @@ export async function resolveProxyForScopeFromRegistry(scope: string, scopeId?: 
     if (normalizedScope === "global") {
       const globalAssignment = db
         .prepare(
-          "SELECT p.id, p.type, p.host, p.port, p.username, p.password, p.notes FROM proxy_assignments a JOIN proxy_registry p ON p.id = a.proxy_id WHERE a.scope = 'global' LIMIT 1"
+          `SELECT p.id, p.type, p.host, p.port, p.username, p.password, p.notes, p.family FROM proxy_assignments a JOIN proxy_registry p ON p.id = a.proxy_id WHERE a.scope = 'global' AND ${PROXY_ALIVE_PREDICATE} LIMIT 1`
         )
         .get();
       return globalAssignment ? toRegistryProxyResolution(globalAssignment, "global", null) : null;
@@ -800,7 +829,7 @@ export async function resolveProxyForScopeFromRegistry(scope: string, scopeId?: 
 
     const assignment = db
       .prepare(
-        "SELECT p.id, p.type, p.host, p.port, p.username, p.password, p.notes FROM proxy_assignments a JOIN proxy_registry p ON p.id = a.proxy_id WHERE a.scope = ? AND a.scope_id = ? LIMIT 1"
+        `SELECT p.id, p.type, p.host, p.port, p.username, p.password, p.notes, p.family FROM proxy_assignments a JOIN proxy_registry p ON p.id = a.proxy_id WHERE a.scope = ? AND a.scope_id = ? AND ${PROXY_ALIVE_PREDICATE} LIMIT 1`
       )
       .get(normalizedScope, normalizedScopeId);
 

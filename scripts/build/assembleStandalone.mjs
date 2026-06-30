@@ -32,7 +32,7 @@
  * Turbopack hashed-chunk patch (.next/server/ *.js)           -               Y           -    SHARED (opt-in: patchTurbopackChunks)
  * --- npm-UNIQUE ---
  * MITM tsc compile -> app/src/mitm/                           -               Y           -    UNIQUE (prepublish)
- * MCP server esbuild -> app/open-sse/mcp-server/server.js     -               Y           -    UNIQUE (prepublish)
+ * MCP server esbuild -> dist/open-sse/mcp-server/server.js    -               Y           -    UNIQUE (prepublish)
  * CLI esbuild -> bin/omniroute.mjs                            -               Y           -    UNIQUE (prepublish)
  * sidecar/doc copies (.env.example, docs/, sync-env, etc.)    -               Y           -    UNIQUE (prepublish)
  * prune + validate (pack-artifact-policy)                      -               Y           -    UNIQUE (prepublish)
@@ -83,6 +83,15 @@ const NATIVE_ASSET_ENTRIES = [
     src: ["node_modules", "better-sqlite3", "build"],
     dest: ["node_modules", "better-sqlite3", "build"],
   },
+  {
+    // TPROXY IP_TRANSPARENT addon (Fase 3 / Epic A). Built by build-tproxy-native
+    // before assembly; Linux-only + opt-in, so the source is absent on non-Linux
+    // builds → syncNativeAssetsToDir skips it gracefully. The runtime loader
+    // (transparentSocket.ts) resolves it cwd-relative to this same dest.
+    label: "TPROXY transparent-socket addon (Linux-only, opt-in)",
+    src: ["src", "mitm", "tproxy", "native", "build", "Release", "transparent.node"],
+    dest: ["src", "mitm", "tproxy", "native", "build", "Release", "transparent.node"],
+  },
 ];
 
 /** @type {{label:string, src:string[], dest:string[]}[]} */
@@ -126,6 +135,11 @@ const EXTRA_MODULE_ENTRIES = [
     dest: ["peer-stamp.mjs"],
   },
   {
+    label: "HTTP method guard (server-ws.mjs dependency)",
+    src: ["scripts", "dev", "http-method-guard.cjs"],
+    dest: ["http-method-guard.cjs"],
+  },
+  {
     label: "responses-ws-proxy (server-ws.mjs dependency)",
     src: ["scripts", "dev", "responses-ws-proxy.mjs"],
     dest: ["responses-ws-proxy.mjs"],
@@ -134,6 +148,12 @@ const EXTRA_MODULE_ENTRIES = [
     label: "webdav-handler (server-ws.mjs dependency)",
     src: ["scripts", "dev", "webdav-handler.mjs"],
     dest: ["webdav-handler.mjs"],
+  },
+  {
+    // #5242: opt-in HTTPS/TLS resolver (server-ws.mjs dependency).
+    label: "tls-options (server-ws.mjs dependency)",
+    src: ["scripts", "dev", "tls-options.mjs"],
+    dest: ["tls-options.mjs"],
   },
   {
     label: "runtime-env script",

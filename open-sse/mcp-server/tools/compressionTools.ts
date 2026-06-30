@@ -242,6 +242,25 @@ import {
   listCompressionCombosInput,
   compressionComboStatsInput,
 } from "../schemas/tools.ts";
+import { handleCcrRetrieve } from "../../services/compression/engines/ccr/index.ts";
+import { resolveCallerScopeContext } from "../scopeEnforcement.ts";
+
+const ccrRetrieveInput = z.object({
+  hash: z
+    .string()
+    .min(6)
+    .max(64)
+    .describe("24-hex content hash from a [CCR retrieve hash=<hash>] marker"),
+  mode: z
+    .enum(["full", "head", "tail", "lines", "grep", "stats"])
+    .optional()
+    .describe("Retrieval mode: full (default) | head | tail | lines | grep | stats"),
+  n: z.number().int().positive().max(10000).optional().describe("head/tail: number of lines"),
+  start: z.number().int().positive().optional().describe("lines: 1-indexed inclusive start"),
+  end: z.number().int().positive().optional().describe("lines: 1-indexed inclusive end"),
+  pattern: z.string().max(512).optional().describe("grep: regex (validated safe; ReDoS-rejected)"),
+  unique: z.boolean().optional().describe("grep: dedupe matching lines"),
+});
 
 export async function handleSetCompressionEngine(
   args: z.infer<typeof setCompressionEngineInput>
@@ -332,5 +351,22 @@ export const compressionTools = {
     inputSchema: compressionComboStatsInput,
     handler: (args: z.infer<typeof compressionComboStatsInput>) =>
       handleCompressionComboStats(args),
+  },
+  omniroute_ccr_retrieve: {
+    name: "omniroute_ccr_retrieve",
+    description:
+      "Retrieve the verbatim content block stored by the CCR compression engine. " +
+      "When a large block is compressed, a marker `[CCR retrieve hash=<24hex> chars=N]` " +
+      "is inserted. Pass the hash from the marker to this tool to get the original text back. " +
+      "Optional `mode` (head/tail/lines/grep/stats) retrieves a slice or summary instead of the whole block; omit for the full block. " +
+      "Scope: read:compression. Always available (sticky-on).",
+    scopes: ["read:compression"],
+    inputSchema: ccrRetrieveInput,
+    handler: (args: z.infer<typeof ccrRetrieveInput>, extra?: McpToolExtraLike) => {
+      // Derive caller identity from MCP auth context so the retrieve is scoped to the
+      // same principal that stored the block. This closes the cross-tenant IDOR (HIGH).
+      const { callerId } = resolveCallerScopeContext(extra, ["read:compression"]);
+      return handleCcrRetrieve(args, callerId === "anonymous" ? undefined : callerId);
+    },
   },
 };

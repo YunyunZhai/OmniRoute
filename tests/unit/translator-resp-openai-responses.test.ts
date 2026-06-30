@@ -112,11 +112,39 @@ test("OpenAI -> Responses: flush on null closes text content and emits response.
   assert.ok(events.some((event) => event.event === "response.completed"));
 });
 
-test("OpenAI -> Responses: <think> tags become reasoning events and normal text still streams", () => {
+test("OpenAI -> Responses: prompt-format <think> tags remain text by default", () => {
   const events = collectEvents([
     {
       id: "chatcmpl-3",
       model: "gpt-4.1",
+      choices: [
+        {
+          index: 0,
+          delta: { content: "<think>Plan it</think>Done." },
+          finish_reason: "stop",
+        },
+      ],
+    },
+  ]);
+
+  assert.equal(
+    events.some((event) => event.event === "response.reasoning_summary_text.delta"),
+    false
+  );
+  assert.ok(
+    events.some(
+      (event) =>
+        event.event === "response.output_text.delta" &&
+        event.data.delta === "<think>Plan it</think>Done."
+    )
+  );
+});
+
+test("OpenAI -> Responses: tag-native models still emit <think> text as reasoning", () => {
+  const events = collectEvents([
+    {
+      id: "chatcmpl-3b",
+      model: "Qwen/QwQ-32B",
       choices: [
         {
           index: 0,
@@ -445,4 +473,46 @@ test("Responses -> OpenAI: response.failed records upstream error", () => {
   assert.equal(state.upstreamError.type, "rate_limit_error");
   assert.equal(state.upstreamError.code, "rate_limit_exceeded");
   assert.match(state.upstreamError.message, /Rate limit reached/);
+});
+
+test("OpenAI -> Responses: deduplicates repeated tool argument snapshots", () => {
+  const args = JSON.stringify({ command: "grep -r pattern /var" });
+  const events = collectEvents([
+    {
+      id: "chatcmpl-tool-snapshot",
+      model: "gpt-4.1",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "shell", arguments: args },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    },
+    {
+      id: "chatcmpl-tool-snapshot",
+      model: "gpt-4.1",
+      choices: [
+        {
+          index: 0,
+          delta: { tool_calls: [{ index: 0, function: { arguments: args } }] },
+          finish_reason: "tool_calls",
+        },
+      ],
+    },
+  ]);
+
+  const done = events.find((event) => event.event === "response.function_call_arguments.done");
+
+  assert.equal(done.data.arguments, args);
+  assert.equal(JSON.parse(done.data.arguments).command, "grep -r pattern /var");
 });

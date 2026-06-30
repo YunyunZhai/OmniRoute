@@ -14,9 +14,12 @@
 // Tudo que é ruído conhecido (superfície proxy OpenAI-compat, refs a arquivos-fonte,
 // APIs upstream de terceiros, placeholders) vai para IGNORE com justificativa, NÃO para
 // a allowlist. A allowlist congela só drift REAL pré-existente de docs.
+// Stale-enforcement (6A.3): entrada em KNOWN_STALE_DOC_REFS que não suprime nenhum miss
+// real → gate falha com instrução de remoção (evita furo de regressão silencioso).
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { assertNoStale } from "./lib/allowlist.mjs";
 
 const ROOT = process.cwd();
 const DOCS = path.join(ROOT, "docs");
@@ -55,13 +58,9 @@ export const KNOWN_STALE_DOC_REFS = new Set([
   // existing guardrailRegistry); the fictional enable/disable/logs rows and the entire
   // shadow table were removed from the doc (shadow A-B comparison is combo-config +
   // /api/combos/metrics). No allowlist entries needed for these anymore.
-  // docs/research/DISCOVERY_TOOL_DESIGN.md — design doc de feature NÃO implementada
-  // (Phase 2). Refs INTENCIONAIS: o doc agora traz um banner "⚠️ Not yet implemented
-  // — Phase 2" acima da tabela de endpoints. Mantidos aqui até a feature existir. — #3498
-  "/api/discovery/results",
-  "/api/discovery/results/:id",
-  "/api/discovery/scan",
-  "/api/discovery/verify/:id",
+  // (DISCOVERY_TOOL_DESIGN.md saiu de docs/research/ para o repo isolado _tasks/research/
+  // — gitignored, fora do escopo deste gate. As 4 entradas /api/discovery/* viraram
+  // obsoletas e foram removidas para satisfazer o stale-enforcement da allowlist.)
   // docs/reference/ENVIRONMENT.md — endpoint UPSTREAM do provedor Blackbox Web,
   // citado na descrição de env var (não é rota do OmniRoute):
   "/api/chat",
@@ -82,9 +81,7 @@ function walk(dir, filter, acc = []) {
 
 export function collectRouteFiles() {
   return new Set(
-    walk(API, (n) => /^route\.tsx?$/.test(n)).map((p) =>
-      path.relative(ROOT, p).replace(/\\/g, "/")
-    )
+    walk(API, (n) => /^route\.tsx?$/.test(n)).map((p) => path.relative(ROOT, p).replace(/\\/g, "/"))
   );
 }
 
@@ -201,6 +198,13 @@ function main() {
     file: path.relative(ROOT, f).replace(/\\/g, "/"),
     paths: extractDocApiPaths(fs.readFileSync(f, "utf8")),
   }));
+
+  // Live misses BEFORE allowlist filtering — used for stale-enforcement.
+  // The paths (not "file → path" strings) are the unit that the allowlist keys on.
+  const allMisses = findStaleDocApiRefs(docPathsByFile, routeFiles, new Set());
+  const liveMissPaths = allMisses.map((m) => m.split(" → ")[1]);
+  assertNoStale(KNOWN_STALE_DOC_REFS, liveMissPaths, "check-docs-symbols");
+
   const misses = findStaleDocApiRefs(docPathsByFile, routeFiles, KNOWN_STALE_DOC_REFS);
   if (misses.length) {
     console.error(
@@ -210,12 +214,14 @@ function main() {
         ` adicione um padrão a IGNORE com justificativa. NÃO adicione à allowlist sem` +
         ` confirmar que é drift pré-existente real.`
     );
-    process.exit(1);
+    process.exitCode = 1;
   }
-  console.log(
-    `[check-docs-symbols] OK — ${docFiles.length} docs canônicas, ` +
-      `${routeFiles.size} rotas conhecidas, ${KNOWN_STALE_DOC_REFS.size} stale congeladas`
-  );
+  if (!process.exitCode) {
+    console.log(
+      `[check-docs-symbols] OK — ${docFiles.length} docs canônicas, ` +
+        `${routeFiles.size} rotas conhecidas, ${KNOWN_STALE_DOC_REFS.size} stale congeladas`
+    );
+  }
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || "").href) main();

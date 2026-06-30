@@ -738,12 +738,14 @@ test("getProviderCredentials skips codex scope-limited accounts unless suppressi
   });
 
   const blocked = await auth.getProviderCredentials("codex", null, null, "codex-spark-mini");
+  const normalCodex = await auth.getProviderCredentials("codex", null, null, "gpt-5.5");
   const bypassed = await auth.getProviderCredentials("codex", null, null, "codex-spark-mini", {
     allowSuppressedConnections: true,
   });
 
   assert.equal(blocked.allRateLimited, true);
   assert.equal(blocked.retryAfter, retryAfter);
+  assert.equal(normalCodex.connectionId, connection.id);
   assert.equal(bypassed.connectionId, connection.id);
 });
 
@@ -1077,6 +1079,14 @@ test("markAccountUnavailable uses configured cooldowns for local 404 model locko
         circuitBreakerReset: 5000,
       },
     },
+    modelLockout: {
+      enabled: true,
+      baseCooldownMs: 250,
+      maxCooldownMs: 1000,
+      maxBackoffSteps: 3,
+      useExponentialBackoff: true,
+      errorCodes: [404],
+    },
   });
 
   const connection = await seedConnection("openai", {
@@ -1101,6 +1111,8 @@ test("markAccountUnavailable uses configured cooldowns for local 404 model locko
   assert.equal(updated.rateLimitedUntil, undefined);
   assert.equal(updated.lastErrorType, "not_found");
   assert.equal(Number(updated.errorCode), 404);
+
+  await settingsDb.updateSettings({ modelLockout: null });
 });
 
 test("markAccountUnavailable applies a model-only lockout for Gemini 429 responses", async () => {
@@ -1263,6 +1275,34 @@ test("markAccountUnavailable honors configured api-key rate-limit cooldowns", as
   assert.equal(result.cooldownMs, 125);
 });
 
+test("Codex quota policy keeps normal and Spark windows separate", async () => {
+  const normalConnection = await seedConnection("codex", {
+    authType: "oauth",
+    name: "codex-normal-quota-policy",
+    apiKey: null,
+    accessToken: "codex-normal-quota-policy-access",
+    refreshToken: "codex-normal-quota-policy-refresh",
+    providerSpecificData: { limitPolicy: { enabled: true, thresholdPercent: 95 } },
+  });
+  quotaCache.setQuotaCache(normalConnection.id, "codex", {
+    session: { remainingPercentage: 80, resetAt: futureIso(60_000) },
+    weekly: { remainingPercentage: 70, resetAt: futureIso(120_000) },
+    gpt_5_3_codex_spark_session: { remainingPercentage: 0, resetAt: futureIso(300_000) },
+  });
+
+  const normalSelected = await auth.getProviderCredentials("codex", null, null, "gpt-5.3-codex");
+  const sparkSelected = await auth.getProviderCredentials(
+    "codex",
+    null,
+    null,
+    "gpt-5.3-codex-spark"
+  );
+
+  assert.equal(normalSelected.connectionId, normalConnection.id);
+  assert.equal(sparkSelected.allRateLimited, true);
+  assert.match(String(sparkSelected.lastError), /configured quota threshold/i);
+});
+
 test("markAccountUnavailable stores Codex scope-specific cooldowns without a global rate limit", async () => {
   const connection = await seedConnection("codex", {
     authType: "oauth",
@@ -1282,6 +1322,7 @@ test("markAccountUnavailable stores Codex scope-specific cooldowns without a glo
   );
   const updated = await providersDb.getProviderConnectionById(connection.id);
   const selected = await auth.getProviderCredentials("codex", null, null, "codex-spark-mini");
+  const normalSelected = await auth.getProviderCredentials("codex", null, null, "gpt-5.3-codex");
 
   assert.equal(result.shouldFallback, true);
   assert.ok(result.cooldownMs > 0);
@@ -1289,6 +1330,7 @@ test("markAccountUnavailable stores Codex scope-specific cooldowns without a glo
   assert.equal(updated.rateLimitedUntil, undefined);
   assert.ok(updated.providerSpecificData.codexScopeRateLimitedUntil.spark);
   assert.equal(selected.allRateLimited, true);
+  assert.equal(normalSelected.connectionId, connection.id);
 });
 
 test("markAccountUnavailable returns without fallback on bad requests", async () => {
@@ -1480,4 +1522,31 @@ test("markAccountUnavailable swallows auto-disable persistence errors", async ()
   } finally {
     db.prepare = originalPrepare;
   }
+});
+
+test("markAccountUnavailable persists in-memory model lockout for combo transient 429 when persistUnavailableState=false", async () => {
+  const connection = await seedConnection("openai", {
+    name: "combo-transient-test",
+  });
+  const model = "gpt-4o";
+  const connId = connection.id as string;
+
+  assert.equal(fallback.isModelLocked("openai", connId, model), false);
+
+  await auth.markAccountUnavailable(connId, 429, "Rate limit exceeded", "openai", model, null, {
+    persistUnavailableState: false,
+  });
+
+  assert.equal(fallback.isModelLocked("openai", connId, model), true);
+
+  assert.equal(fallback.isModelLocked("openai", connId, "gpt-4o-mini"), false);
+
+  const otherConn = await seedConnection("openai", {
+    name: "other-conn",
+  });
+  assert.equal(fallback.isModelLocked("openai", otherConn.id as string, model), false);
+
+  const updated = await providersDb.getProviderConnectionById(connId);
+  assert.equal(updated.rateLimitedUntil == null, true);
+  assert.notEqual(updated.testStatus, "unavailable");
 });

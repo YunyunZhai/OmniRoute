@@ -35,7 +35,6 @@ import { isUserCallableAgyModelId } from "@omniroute/open-sse/config/agyModels.t
 import { onUsageRecorded } from "./usageEvents";
 
 type JsonRecord = Record<string, unknown>;
-
 type SyncSource = "manual" | "scheduled";
 
 interface ProviderConnectionLike {
@@ -64,12 +63,16 @@ const PROVIDER_LIMITS_APIKEY_PROVIDERS = new Set([
   "zai",
   "glmt",
   "opencode-go",
+  "ollama-cloud",
   "minimax",
   "minimax-cn",
   "crof",
   "nanogpt",
   "deepseek",
   "xiaomi-mimo",
+  "vertex",
+  "vertex-partner",
+  "kimi-coding-apikey",
 ]);
 const DEFAULT_PROVIDER_LIMITS_SYNC_INTERVAL_MINUTES = 70;
 const PROVIDER_LIMITS_AUTO_SYNC_SETTING_KEY = "provider_limits_auto_sync_last_run";
@@ -288,7 +291,7 @@ export async function refreshAndUpdateCredentials(
   if (!shouldAttemptRotatingRefresh(connection.provider, opts.allowRotatingRefresh)) {
     return { connection, refreshed: false };
   }
-  const executor = getExecutor(connection.provider);
+  const executor = await getExecutor(connection.provider);
   const credentials = {
     connectionId: connection.id,
     accessToken: connection.accessToken,
@@ -324,7 +327,12 @@ export async function refreshAndUpdateCredentials(
     | null;
 
   if (!refreshResult) {
-    if (connection.provider === "github" && connection.accessToken) {
+    // Refresh failed but we still have an accessToken — fall back to the
+    // existing token for ANY OAuth provider (graceful degradation) instead of
+    // hard-failing. Previously this was qualified to `provider === "github"`,
+    // which left every other provider stuck on a transient refresh failure even
+    // when a usable access token was still on hand.
+    if (connection.accessToken) {
       return { connection, refreshed: false };
     }
     throw withStatus(
@@ -666,9 +674,15 @@ async function fetchLiveProviderLimitsWithOptions(
   }
 
   if (connection.authType !== "oauth") {
+    // L3: route the API-key usage/quota fetch through the connection's proxy context,
+    // mirroring the OAuth branch below (proxyInfo?.proxy ?? null). Without this, API-key
+    // usage egresses on the host IP, ignoring the connection's assigned proxy.
+    const apiKeyProxy = await resolveProxyForConnection(connectionId);
     const usage = sanitizeUsageQuotasForProvider(
       connection.provider,
-      (await getUsageForProvider(connection as unknown as JsonRecord, options)) as JsonRecord
+      (await runWithProxyContext(apiKeyProxy?.proxy ?? null, () =>
+        getUsageForProvider(connection as unknown as JsonRecord, options)
+      )) as JsonRecord
     );
     if (isRecord(usage.quotas)) {
       setQuotaCache(connectionId, connection.provider, usage.quotas);

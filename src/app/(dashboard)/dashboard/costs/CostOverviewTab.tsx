@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
+import { useProviderNodeMap, resolveProviderName } from "@/lib/display/useProviderNodeMap";
 import { Card, EmptyState, SegmentedControl, CardSkeleton } from "@/shared/components";
 import {
   getServiceTierDisplayLabel,
@@ -30,7 +32,15 @@ import {
   type CostExplorerSortKey,
 } from "./costExplorerUtils";
 
-type CostRange = "7d" | "30d" | "90d" | "all";
+import {
+  parseApiKeyIds,
+  parseCostRange,
+  parseExplorerGroupBy,
+  type CostRange,
+} from "./costExplorerParams";
+import { ApiKeyUsageLimitCard } from "./components/ApiKeyUsageLimitCard";
+import { MetricCard } from "./components/MetricCard";
+import { useApiKeyUsageLimits } from "./useApiKeyUsageLimits";
 
 interface UsageAnalyticsSummary {
   totalCost: number;
@@ -273,8 +283,14 @@ function downloadFile(content: string, filename: string, mimeType: string) {
 export default function CostOverviewTab() {
   const t = useTranslations("costs");
   const locale = useLocale();
+  const nodeMap = useProviderNodeMap();
+  const searchParams = useSearchParams();
+  const apiKeyIdsParam = searchParams.get("apiKeyIds");
+  const selectedApiKeyIds = useMemo(() => parseApiKeyIds(apiKeyIdsParam), [apiKeyIdsParam]);
+  const selectedApiKeyId = selectedApiKeyIds.length === 1 ? selectedApiKeyIds[0] : null;
+  const apiKeyFilter = useMemo(() => selectedApiKeyIds.join(","), [selectedApiKeyIds]);
   const currencyFormatter = useMemo(() => createCurrencyFormatter(locale), [locale]);
-  const [range, setRange] = useState<CostRange>("30d");
+  const [range, setRange] = useState<CostRange>(() => parseCostRange(searchParams.get("range")));
   const [analytics, setAnalytics] = useState<UsageAnalyticsPayload | null>(null);
   const [presetCosts, setPresetCosts] = useState<Record<"1d" | "7d" | "30d", number>>({
     "1d": 0,
@@ -284,11 +300,18 @@ export default function CostOverviewTab() {
   const [loading, setLoading] = useState(true);
   const [summaryLoading, setSummaryLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [explorerGroupBy, setExplorerGroupBy] = useState<CostExplorerGroupBy>("provider");
+  const [explorerGroupBy, setExplorerGroupBy] = useState<CostExplorerGroupBy>(() =>
+    parseExplorerGroupBy(searchParams.get("groupBy"))
+  );
   const [explorerSearch, setExplorerSearch] = useState("");
   const [explorerSortKey, setExplorerSortKey] = useState<CostExplorerSortKey>("cost");
   const [explorerSortDirection, setExplorerSortDirection] =
     useState<CostExplorerSortDirection>("desc");
+  const {
+    payload: apiKeyUsageLimits,
+    loading: apiKeyUsageLimitsLoading,
+    save: saveApiKeyUsageLimits,
+  } = useApiKeyUsageLimits(selectedApiKeyId);
 
   useEffect(() => {
     let active = true;
@@ -297,9 +320,12 @@ export default function CostOverviewTab() {
       try {
         setLoading(true);
         setSummaryLoading(true);
-        const response = await fetch(
-          `/api/usage/analytics?range=${encodeURIComponent(range)}&presets=1d,7d,30d`
-        );
+        const params = new URLSearchParams({
+          range,
+          presets: "1d,7d,30d",
+        });
+        if (apiKeyFilter) params.set("apiKeyIds", apiKeyFilter);
+        const response = await fetch(`/api/usage/analytics?${params.toString()}`);
         if (!response.ok) {
           throw new Error(t("overviewLoadFailed"));
         }
@@ -330,7 +356,7 @@ export default function CostOverviewTab() {
     return () => {
       active = false;
     };
-  }, [range, t]);
+  }, [apiKeyFilter, range, t]);
 
   const selectedRangeLabel = t(
     RANGE_OPTIONS.find((option) => option.value === range)?.labelKey || "range30d"
@@ -353,7 +379,8 @@ export default function CostOverviewTab() {
 
   const providersByCost = [...(analytics?.byProvider || [])]
     .filter((provider) => (hasCostData ? provider.cost > 0 : provider.requests > 0))
-    .sort((left, right) => (hasCostData ? right.cost - left.cost : right.requests - left.requests));
+    .sort((left, right) => (hasCostData ? right.cost - left.cost : right.requests - left.requests))
+    .map((row) => ({ ...row, provider: resolveProviderName(row.provider, nodeMap) }));
   const modelsByCost = [...(analytics?.byModel || [])]
     .filter((model) => (hasCostData ? model.cost > 0 : model.requests > 0))
     .sort((left, right) => (hasCostData ? right.cost - left.cost : right.requests - left.requests));
@@ -521,6 +548,15 @@ export default function CostOverviewTab() {
           color="text-amber-400"
         />
       </div>
+
+      {selectedApiKeyId && (
+        <ApiKeyUsageLimitCard
+          payload={apiKeyUsageLimits}
+          loading={apiKeyUsageLimitsLoading}
+          locale={locale}
+          onSave={saveApiKeyUsageLimits}
+        />
+      )}
 
       <Card className="p-5">
         <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
@@ -849,28 +885,6 @@ export default function CostOverviewTab() {
         </>
       )}
     </div>
-  );
-}
-
-function MetricCard({
-  label,
-  value,
-  subValue,
-  color = "text-text-main",
-  loading = false,
-}: {
-  label: string;
-  value: string;
-  subValue?: string;
-  color?: string;
-  loading?: boolean;
-}) {
-  return (
-    <Card className="px-4 py-3">
-      <p className="text-xs uppercase tracking-wide text-text-muted font-semibold">{label}</p>
-      <p className={`text-2xl font-bold mt-1 ${color}`}>{loading ? "…" : value}</p>
-      {subValue ? <p className="text-xs text-text-muted mt-1">{subValue}</p> : null}
-    </Card>
   );
 }
 

@@ -4,6 +4,7 @@
 
 import { v4 as uuidv4 } from "uuid";
 import { getDbInstance, rowToCamel, cleanNulls } from "./core";
+import { selectProviderNodeForConnection } from "./providerNodeSelect";
 import { backupDbFile } from "./backup";
 import {
   encryptConnectionFields,
@@ -13,6 +14,7 @@ import {
 import { invalidateDbCache } from "./readCache";
 import { normalizeProviderSpecificData } from "@/lib/providers/requestDefaults";
 import { bumpProxyConfigGeneration } from "./settings";
+import { webSessionCredentialKey, parseProviderSpecificData } from "./webSessionDedup";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -190,6 +192,42 @@ export async function getProviderConnectionById(id: string) {
   );
 }
 
+// #3368 PR6 — dedup web-session cookie/token credentials on connection create.
+// Re-importing the same session (e.g. via bulk web-session import) under a
+// different or blank name must update the existing connection instead of
+// inserting a duplicate, mirroring the apikey dedup (#3023). Extracted from
+// createProviderConnection to keep that function below the complexity baseline.
+// provider_specific_data is plaintext JSON, so the value is compared directly
+// without decryption.
+function findExistingCookieConnection(
+  db: DbLike,
+  provider: unknown,
+  name: unknown,
+  normalizedProviderSpecificData: unknown
+): JsonRecord | null {
+  // 1) Name-based upsert for parity with the apikey path.
+  if (name) {
+    const byName =
+      (db
+        .prepare(
+          "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'cookie' AND name = ?"
+        )
+        .get(provider, name) as JsonRecord | undefined) || null;
+    if (byName) return byName;
+  }
+  // 2) Credential-value dedup against existing cookie rows.
+  const newCredKey = webSessionCredentialKey(normalizedProviderSpecificData);
+  if (!newCredKey) return null;
+  const cookieRows = db
+    .prepare("SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'cookie'")
+    .all(provider) as JsonRecord[];
+  for (const row of cookieRows) {
+    const psd = parseProviderSpecificData(row.provider_specific_data);
+    if (psd && webSessionCredentialKey(psd) === newCredKey) return row;
+  }
+  return null;
+}
+
 export async function createProviderConnection(data: JsonRecord) {
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
@@ -267,6 +305,13 @@ export async function createProviderConnection(data: JsonRecord) {
         }
       }
     }
+  } else if (data.authType === "cookie") {
+    existing = findExistingCookieConnection(
+      db,
+      data.provider,
+      data.name,
+      normalizedProviderSpecificData
+    );
   }
 
   if (existing) {
@@ -772,6 +817,18 @@ export async function getProviderNodeById(id: string) {
   const db = getDbInstance() as unknown as DbLike;
   const row = db.prepare("SELECT * FROM provider_nodes WHERE id = ?").get(id);
   return row ? rowToCamel(row) : null;
+}
+
+// #4421: resolve the provider node for a new connection from either its concrete id
+// (what the dashboard sends, "<type>-<uuid>") OR the bare derived type (what callers
+// using the /api/providers API directly often pass, e.g. "openai-compatible-responses").
+// Falls back to the sole node of that type only when unambiguous; otherwise null (so the
+// caller still surfaces the existing 404).
+export async function resolveProviderNodeForConnection(idOrType: string) {
+  const exact = await getProviderNodeById(idOrType);
+  if (exact) return exact;
+  const all = (await getProviderNodes()) as JsonRecord[];
+  return selectProviderNodeForConnection(idOrType, all);
 }
 
 export async function createProviderNode(data: JsonRecord) {
